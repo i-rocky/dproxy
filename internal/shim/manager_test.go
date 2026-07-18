@@ -131,6 +131,15 @@ func TestOwnedReturnsFalseWhenManagedLinkDisappears(t *testing.T) {
 	require.False(t, owned)
 }
 
+func TestOwnedReturnsFalseWhenBinDirectoryDisappears(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(nil))
+	require.NoError(t, os.Remove(m.BinDir))
+	owned, err := m.Owned("node")
+	require.NoError(t, err)
+	require.False(t, owned)
+}
+
 func TestOwnedRejectsOversizedAndSymlinkedMetadata(t *testing.T) {
 	m := newShimManager(t)
 	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
@@ -232,17 +241,80 @@ func TestSyncRecoversInterruptedPublishedUpdate(t *testing.T) {
 	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
 	afterObjectPublish = func(name string) error {
 		if name == "node" {
-			return errors.New("simulated crash")
+			return errInterrupted
 		}
 		return nil
 	}
 	require.Error(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	record, err := readRecordAtPath(m, "node")
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Temp)
+	require.NotZero(t, record.PreviousInode)
+	require.FileExists(t, filepath.Join(m.BinDir, record.Temp))
 	afterObjectPublish = nil
 	t.Cleanup(func() { afterObjectPublish = nil })
 	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
 	owned, err := m.Owned("node")
 	require.NoError(t, err)
 	require.True(t, owned)
+}
+
+func TestSyncRecoversInterruptedPublishedFreshCreate(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(nil))
+	afterObjectPublish = func(name string) error {
+		if name == "node" {
+			return errInterrupted
+		}
+		return nil
+	}
+	require.ErrorIs(t, m.Sync(map[string]Target{"node": {Binary: "node"}}), errInterrupted)
+	record, err := readRecordAtPath(m, "node")
+	require.NoError(t, err)
+	require.Zero(t, record.PreviousInode)
+	require.NotEmpty(t, record.Temp)
+	require.FileExists(t, filepath.Join(m.BinDir, "node"))
+	afterObjectPublish = nil
+	t.Cleanup(func() { afterObjectPublish = nil })
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+}
+
+func TestSyncRecoversInterruptedPublishedGenericUpdate(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(nil))
+	afterObjectPublish = func(name string) error {
+		if name == genericName {
+			return errInterrupted
+		}
+		return nil
+	}
+	require.ErrorIs(t, m.Sync(nil), errInterrupted)
+	record, err := readRecordAtPath(m, genericName)
+	require.NoError(t, err)
+	require.NotEmpty(t, record.Temp)
+	require.NotZero(t, record.PreviousInode)
+	require.FileExists(t, filepath.Join(m.ShimDir, record.Temp))
+	afterObjectPublish = nil
+	t.Cleanup(func() { afterObjectPublish = nil })
+	require.NoError(t, m.Sync(nil))
+}
+
+func TestSyncRecoversInterruptedPublishedFreshGeneric(t *testing.T) {
+	m := newShimManager(t)
+	afterObjectPublish = func(name string) error {
+		if name == genericName {
+			return errInterrupted
+		}
+		return nil
+	}
+	require.ErrorIs(t, m.Sync(nil), errInterrupted)
+	record, err := readRecordAtPath(m, genericName)
+	require.NoError(t, err)
+	require.Zero(t, record.PreviousInode)
+	require.FileExists(t, filepath.Join(m.ShimDir, genericName))
+	afterObjectPublish = nil
+	t.Cleanup(func() { afterObjectPublish = nil })
+	require.NoError(t, m.Sync(nil))
 }
 
 func TestSyncRecoversInterruptedTransitionBeforeCreate(t *testing.T) {
@@ -293,6 +365,23 @@ func TestSyncNeverDeletesCollidingRandomTemp(t *testing.T) {
 	require.Equal(t, []byte("unmanaged"), got)
 }
 
+func TestOwnershipWriteNeverDeletesCollidingRandomTemp(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(nil))
+	owners := filepath.Join(m.ShimDir, ".owners")
+	collision := filepath.Join(owners, ".record-"+string(bytes.Repeat([]byte{'0'}, 32)))
+	require.NoError(t, os.WriteFile(collision, []byte("unmanaged"), 0600))
+	randomReader = bytes.NewReader(make([]byte, 16))
+	t.Cleanup(func() { randomReader = rand.Reader })
+	fd, err := unix.Open(owners, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	require.NoError(t, err)
+	defer unix.Close(fd)
+	require.Error(t, writeRecordAt(fd, ownership{Schema: 1, Name: "node"}))
+	got, err := os.ReadFile(collision)
+	require.NoError(t, err)
+	require.Equal(t, []byte("unmanaged"), got)
+}
+
 func TestShimRefusesSymlinkedManagedRootAncestor(t *testing.T) {
 	m := newShimManager(t)
 	base := t.TempDir()
@@ -303,4 +392,152 @@ func TestShimRefusesSymlinkedManagedRootAncestor(t *testing.T) {
 	m.ShimDir = filepath.Join(link, "shims")
 	require.Error(t, m.Sync(nil))
 	require.NoDirExists(t, filepath.Join(real, "shims"))
+}
+
+func TestShimManagedDirectoryPublishRefusesRacerSubstitution(t *testing.T) {
+	m := newShimManager(t)
+	beforeDirPublish = func(parentFD int, _, final string) { beforeDirPublish = nil; _ = unix.Mkdirat(parentFD, final, 0700) }
+	t.Cleanup(func() { beforeDirPublish = nil })
+	require.ErrorIs(t, m.Sync(nil), ErrCollision)
+	require.DirExists(t, m.ShimDir)
+}
+
+func TestShimManagedChildPublishRefusesRacerSubstitution(t *testing.T) {
+	m := newShimManager(t)
+	beforeDirPublish = func(parentFD int, _, final string) {
+		if final == ".owners" {
+			beforeDirPublish = nil
+			_ = unix.Mkdirat(parentFD, final, 0700)
+		}
+	}
+	t.Cleanup(func() { beforeDirPublish = nil })
+	require.ErrorIs(t, m.Sync(nil), ErrCollision)
+}
+
+func TestShimPlainBinDirectoryPublishKeepsRacerDirectory(t *testing.T) {
+	m := newShimManager(t)
+	beforePlainDirPublish = func(parentFD int, _, final string) {
+		beforePlainDirPublish = nil
+		_ = unix.Mkdirat(parentFD, final, 0700)
+	}
+	t.Cleanup(func() { beforePlainDirPublish = nil })
+	require.NoError(t, m.Sync(nil))
+	require.DirExists(t, m.BinDir)
+}
+
+func TestShimRandomFailureLeavesNoPublishedRoots(t *testing.T) {
+	m := newShimManager(t)
+	randomReader = errorReader{}
+	t.Cleanup(func() { randomReader = rand.Reader })
+	require.Error(t, m.Sync(nil))
+	require.NoDirExists(t, m.ShimDir)
+}
+
+type errorReader struct{}
+
+func (errorReader) Read([]byte) (int, error) { return 0, errors.New("random failure") }
+
+func TestRemoveRecordFailuresRestoreLiveLinkAndFinalRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		inject func()
+	}{
+		{"before unlink", func() { beforeRemoveCommit = func(string) error { return errors.New("record unlink failure") } }},
+		{"after unlink", func() { afterRemoveUnlink = func(string) error { return errors.New("record fsync failure") } }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newShimManager(t)
+			require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+			tc.inject()
+			t.Cleanup(func() { beforeRemoveCommit = nil; afterRemoveUnlink = nil })
+			require.Error(t, m.Remove("node"))
+			beforeRemoveCommit = nil
+			afterRemoveUnlink = nil
+			owned, err := m.Owned("node")
+			require.NoError(t, err)
+			require.True(t, owned)
+			record, err := readRecordAtPath(m, "node")
+			require.NoError(t, err)
+			require.False(t, record.Removing)
+		})
+	}
+}
+
+func TestRemoveMissingManagedLinkRestoresFinalRecord(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	require.NoError(t, os.Remove(filepath.Join(m.BinDir, "node")))
+	require.Error(t, m.Remove("node"))
+	record, err := readRecordAtPath(m, "node")
+	require.NoError(t, err)
+	require.False(t, record.Removing)
+}
+
+func TestRemoveRecoversInterruptedRename(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	afterRemoveRename = func(string) error { return errInterrupted }
+	t.Cleanup(func() { afterRemoveRename = nil })
+	require.ErrorIs(t, m.Remove("node"), errInterrupted)
+	record, err := readRecordAtPath(m, "node")
+	require.NoError(t, err)
+	require.True(t, record.Removing)
+	require.NoFileExists(t, filepath.Join(m.BinDir, "node"))
+	require.FileExists(t, filepath.Join(m.ShimDir, ".trash", record.RemoveQ))
+	require.FileExists(t, filepath.Join(m.ShimDir, ".trash", record.Backup))
+	afterRemoveRename = nil
+	owned, err := m.Owned("node")
+	require.NoError(t, err)
+	require.False(t, owned)
+	require.NoFileExists(t, m.recordPath("node"))
+}
+
+func TestRemoveRecoversInterruptedTransitionBeforeMutation(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	afterRemoveTransition = func(string) error { return errInterrupted }
+	t.Cleanup(func() { afterRemoveTransition = nil })
+	require.ErrorIs(t, m.Remove("node"), errInterrupted)
+	record, err := readRecordAtPath(m, "node")
+	require.NoError(t, err)
+	require.True(t, record.Removing)
+	require.FileExists(t, filepath.Join(m.BinDir, "node"))
+	afterRemoveTransition = nil
+	owned, err := m.Owned("node")
+	require.NoError(t, err)
+	require.True(t, owned)
+	record, err = readRecordAtPath(m, "node")
+	require.NoError(t, err)
+	require.False(t, record.Removing)
+}
+
+func TestRemoveRecoveryRestoresWhenQuarantineWasSubstituted(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	afterRemoveRename = func(string) error { return errInterrupted }
+	require.ErrorIs(t, m.Remove("node"), errInterrupted)
+	afterRemoveRename = nil
+	t.Cleanup(func() { afterRemoveRename = nil })
+	record, err := readRecordAtPath(m, "node")
+	require.NoError(t, err)
+	trashFD, err := unix.Open(filepath.Join(m.ShimDir, ".trash"), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	require.NoError(t, err)
+	require.NoError(t, unix.Renameat(trashFD, record.RemoveQ, trashFD, record.RemoveQ+"-owned"))
+	require.NoError(t, unix.Symlinkat("unmanaged", trashFD, record.RemoveQ))
+	require.NoError(t, unix.Close(trashFD))
+	owned, err := m.Owned("node")
+	require.NoError(t, err)
+	require.True(t, owned)
+	target, err := os.Readlink(filepath.Join(m.ShimDir, ".trash", record.RemoveQ))
+	require.NoError(t, err)
+	require.Equal(t, "unmanaged", target)
+}
+
+func readRecordAtPath(m Manager, name string) (ownership, error) {
+	fd, err := unix.Open(filepath.Join(m.ShimDir, ".owners"), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return ownership{}, err
+	}
+	defer unix.Close(fd)
+	return readRecordAt(fd, name)
 }

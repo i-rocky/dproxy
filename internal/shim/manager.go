@@ -19,16 +19,22 @@ const genericName = "dproxy-shim"
 const rootMarker = ".dproxy-shim-owner"
 
 var (
-	ErrCollision                          = errors.New("unmanaged shim collision")
-	ErrUnsafeName                         = errors.New("unsafe shim name")
-	errInterrupted                        = errors.New("simulated interrupted transaction")
-	namePattern                           = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-	randomReader       io.Reader          = rand.Reader
-	beforeRecordCommit func(string) error // test-only fault injection
-	afterTransition    func(string) error // test-only crash injection
-	afterObjectPublish func(string) error // test-only crash injection
-	beforeFinalRecord  func(string) error // test-only durable-commit fault injection
-	beforeRemoveVerify func(int, string)  // test-only race injection
+	ErrCollision                                    = errors.New("unmanaged shim collision")
+	ErrUnsafeName                                   = errors.New("unsafe shim name")
+	errInterrupted                                  = errors.New("simulated interrupted transaction")
+	namePattern                                     = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	randomReader          io.Reader                 = rand.Reader
+	beforeRecordCommit    func(string) error        // test-only fault injection
+	afterTransition       func(string) error        // test-only crash injection
+	afterObjectPublish    func(string) error        // test-only crash injection
+	beforeFinalRecord     func(string) error        // test-only durable-commit fault injection
+	beforeRemoveVerify    func(int, string)         // test-only race injection
+	beforeDirPublish      func(int, string, string) // test-only publish-race injection
+	beforePlainDirPublish func(int, string, string) // test-only plain-dir race injection
+	afterRemoveRename     func(string) error        // test-only removal crash injection
+	afterRemoveTransition func(string) error        // test-only pre-mutation crash injection
+	beforeRemoveCommit    func(string) error        // test-only record failure injection
+	afterRemoveUnlink     func(string) error        // test-only fsync failure injection
 )
 
 type Target struct{ Binary string }
@@ -38,6 +44,8 @@ type ownership struct {
 	Name, Binary, Target, Kind                   string
 	Device, Inode, PreviousDevice, PreviousInode uint64
 	Temp, TempDir                                string
+	Removing                                     bool
+	RemoveQ, Backup                              string
 }
 type dirOwner struct {
 	Schema        int `json:"schema"`
@@ -65,7 +73,7 @@ func (m Manager) Sync(targets map[string]Target) error {
 		return err
 	}
 	defer unix.Close(binFD)
-	if err := m.recover(ownersFD, binFD, shimFD); err != nil {
+	if err := m.recover(ownersFD, binFD, shimFD, trashFD); err != nil {
 		return err
 	}
 	if err := m.syncGeneric(shimFD, ownersFD); err != nil {
@@ -112,7 +120,7 @@ func (m Manager) Remove(name string) error {
 		return err
 	}
 	defer unix.Close(binFD)
-	if err := m.recover(ownersFD, binFD, shimFD); err != nil {
+	if err := m.recover(ownersFD, binFD, shimFD, trashFD); err != nil {
 		return err
 	}
 	record, err := readRecordAt(ownersFD, name)
@@ -130,7 +138,24 @@ func (m Manager) Remove(name string) error {
 	if err != nil {
 		return err
 	}
+	oldRecord := record
+	transition := record
+	transition.Removing, transition.RemoveQ, transition.Backup = true, q, backup
+	if err := writeRecordAt(ownersFD, transition); err != nil {
+		return err
+	}
+	if afterRemoveTransition != nil {
+		if err := afterRemoveTransition(name); err != nil {
+			return err
+		}
+	}
 	if err := unix.Linkat(binFD, name, trashFD, backup, 0); err != nil {
+		_ = writeRecordAt(ownersFD, oldRecord)
+		return err
+	}
+	if err := unix.Fsync(trashFD); err != nil {
+		_ = unix.Unlinkat(trashFD, backup, 0)
+		_ = writeRecordAt(ownersFD, oldRecord)
 		return err
 	}
 	var backupStat unix.Stat_t
@@ -140,7 +165,20 @@ func (m Manager) Remove(name string) error {
 	}
 	if err := unix.Renameat2(binFD, name, trashFD, q, unix.RENAME_NOREPLACE); err != nil {
 		_ = unix.Unlinkat(trashFD, backup, 0)
+		_ = unix.Fsync(trashFD)
+		_ = writeRecordAt(ownersFD, oldRecord)
 		return err
+	}
+	if err := unix.Fsync(binFD); err != nil {
+		return err
+	}
+	if err := unix.Fsync(trashFD); err != nil {
+		return err
+	}
+	if afterRemoveRename != nil {
+		if err := afterRemoveRename(name); err != nil {
+			return err
+		}
 	}
 	restore := func() error { return unix.Renameat2(trashFD, backup, binFD, name, unix.RENAME_NOREPLACE) }
 	if beforeRemoveVerify != nil {
@@ -152,7 +190,34 @@ func (m Manager) Remove(name string) error {
 		if err := restore(); err != nil {
 			return fmt.Errorf("restore unverified shim: %w", err)
 		}
+		_ = unix.Fsync(binFD)
+		_ = writeRecordAt(ownersFD, oldRecord)
 		return ErrCollision
+	}
+	commitErr := error(nil)
+	if beforeRemoveCommit != nil {
+		commitErr = beforeRemoveCommit(name)
+	}
+	if commitErr == nil {
+		commitErr = unix.Unlinkat(ownersFD, recordName(name), 0)
+	}
+	if commitErr == nil && afterRemoveUnlink != nil {
+		commitErr = afterRemoveUnlink(name)
+	}
+	if commitErr == nil {
+		commitErr = unix.Fsync(ownersFD)
+	}
+	if commitErr != nil {
+		if err := restore(); err != nil {
+			return fmt.Errorf("rollback removal: %w", err)
+		}
+		_ = unix.Fsync(binFD)
+		_ = unix.Unlinkat(trashFD, q, 0)
+		_ = unix.Fsync(trashFD)
+		if err := writeRecordAt(ownersFD, oldRecord); err != nil {
+			return err
+		}
+		return commitErr
 	}
 	if err := unix.Unlinkat(trashFD, q, 0); err != nil {
 		return err
@@ -160,20 +225,14 @@ func (m Manager) Remove(name string) error {
 	if err := unix.Unlinkat(trashFD, backup, 0); err != nil {
 		return err
 	}
-	if err := unix.Fsync(trashFD); err != nil {
-		return err
-	}
-	if err := unix.Unlinkat(ownersFD, recordName(name), 0); err != nil {
-		return err
-	}
-	return unix.Fsync(ownersFD)
+	return unix.Fsync(trashFD)
 }
 
 func (m Manager) Owned(name string) (bool, error) {
 	if !validName(name) {
 		return false, ErrUnsafeName
 	}
-	shimFD, ownersFD, _, err := m.openManagedRoots(false)
+	shimFD, ownersFD, trashFD, err := m.openManagedRoots(false)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
@@ -182,6 +241,7 @@ func (m Manager) Owned(name string) (bool, error) {
 	}
 	defer unix.Close(shimFD)
 	defer unix.Close(ownersFD)
+	defer unix.Close(trashFD)
 	binFD, _, err := openAbsoluteDir(m.BinDir, false)
 	if err != nil {
 		if err == unix.ENOENT {
@@ -190,7 +250,7 @@ func (m Manager) Owned(name string) (bool, error) {
 		return false, err
 	}
 	defer unix.Close(binFD)
-	if err := m.recover(ownersFD, binFD, shimFD); err != nil {
+	if err := m.recover(ownersFD, binFD, shimFD, trashFD); err != nil {
 		return false, err
 	}
 	record, err := readRecordAt(ownersFD, name)
@@ -348,7 +408,7 @@ func (m Manager) publish(objectFD, ownersFD int, name, binary, target, kind, tmp
 	return nil
 }
 
-func (m Manager) recover(ownersFD, binFD, shimFD int) error {
+func (m Manager) recover(ownersFD, binFD, shimFD, trashFD int) error {
 	names, err := dirNames(ownersFD)
 	if err != nil {
 		return err
@@ -361,6 +421,12 @@ func (m Manager) recover(ownersFD, binFD, shimFD int) error {
 		record, err := readRecordAt(ownersFD, name)
 		if err != nil {
 			return err
+		}
+		if record.Removing {
+			if err := recoverRemoval(ownersFD, binFD, trashFD, record); err != nil {
+				return err
+			}
+			continue
 		}
 		if record.Temp == "" {
 			continue
@@ -414,18 +480,52 @@ func (m Manager) recover(ownersFD, binFD, shimFD int) error {
 	return nil
 }
 
+func recoverRemoval(ownersFD, binFD, trashFD int, r ownership) error {
+	var live, q, backup unix.Stat_t
+	liveErr := unix.Fstatat(binFD, r.Name, &live, unix.AT_SYMLINK_NOFOLLOW)
+	qErr := unix.Fstatat(trashFD, r.RemoveQ, &q, unix.AT_SYMLINK_NOFOLLOW)
+	backupErr := unix.Fstatat(trashFD, r.Backup, &backup, unix.AT_SYMLINK_NOFOLLOW)
+	final := r
+	final.Removing = false
+	final.RemoveQ = ""
+	final.Backup = ""
+	if liveErr == nil && matches(r, live) {
+		if backupErr == nil && matches(r, backup) {
+			_ = unix.Unlinkat(trashFD, r.Backup, 0)
+			_ = unix.Fsync(trashFD)
+		}
+		return writeRecordAt(ownersFD, final)
+	}
+	if liveErr == unix.ENOENT && qErr == nil && matches(r, q) && backupErr == nil && matches(r, backup) {
+		if err := unix.Unlinkat(ownersFD, recordName(r.Name), 0); err != nil {
+			return err
+		}
+		if err := unix.Fsync(ownersFD); err != nil {
+			return err
+		}
+		if err := unix.Unlinkat(trashFD, r.RemoveQ, 0); err != nil {
+			return err
+		}
+		if err := unix.Unlinkat(trashFD, r.Backup, 0); err != nil {
+			return err
+		}
+		return unix.Fsync(trashFD)
+	}
+	if liveErr == unix.ENOENT && backupErr == nil && matches(r, backup) {
+		if err := unix.Renameat2(trashFD, r.Backup, binFD, r.Name, unix.RENAME_NOREPLACE); err != nil {
+			return err
+		}
+		if err := unix.Fsync(binFD); err != nil {
+			return err
+		}
+		return writeRecordAt(ownersFD, final)
+	}
+	return ErrCollision
+}
+
 func (m Manager) openManagedRoots(create bool) (int, int, int, error) {
-	shimFD, created, err := openAbsoluteDir(m.ShimDir, create)
+	shimFD, err := openAbsoluteManagedDir(m.ShimDir, create)
 	if err != nil {
-		return -1, -1, -1, err
-	}
-	if created {
-		err = createDirOwner(shimFD)
-	} else {
-		err = verifyDirOwner(shimFD)
-	}
-	if err != nil {
-		unix.Close(shimFD)
 		return -1, -1, -1, err
 	}
 	ownersFD, err := managedChild(shimFD, ".owners", create)
@@ -443,27 +543,86 @@ func (m Manager) openManagedRoots(create bool) (int, int, int, error) {
 }
 
 func managedChild(parent int, name string, create bool) (int, error) {
-	created := false
 	fd, err := openDirAt(parent, name)
-	if err == unix.ENOENT && create {
-		if err = unix.Mkdirat(parent, name, 0700); err == nil {
-			created = true
-			fd, err = openDirAt(parent, name)
+	if err == nil {
+		if err := verifyDirOwner(fd); err != nil {
+			unix.Close(fd)
+			return -1, err
 		}
+		return fd, nil
 	}
+	if err != unix.ENOENT || !create {
+		return -1, err
+	}
+	return publishManagedDir(parent, name)
+}
+
+func publishManagedDir(parent int, name string) (int, error) {
+	tmp, err := randomName(".managed-dir-")
 	if err != nil {
 		return -1, err
 	}
-	if created {
-		err = createDirOwner(fd)
-	} else {
-		err = verifyDirOwner(fd)
+	if err = unix.Mkdirat(parent, tmp, 0700); err != nil {
+		return -1, err
 	}
+	fd, err := openDirAt(parent, tmp)
 	if err != nil {
+		_ = unix.Unlinkat(parent, tmp, unix.AT_REMOVEDIR)
+		return -1, err
+	}
+	cleanup := func() {
+		_ = unix.Unlinkat(fd, rootMarker, 0)
+		_ = unix.Close(fd)
+		_ = unix.Unlinkat(parent, tmp, unix.AT_REMOVEDIR)
+	}
+	if err = createDirOwner(fd); err != nil {
+		cleanup()
+		return -1, err
+	}
+	if beforeDirPublish != nil {
+		beforeDirPublish(parent, tmp, name)
+	}
+	if err = unix.Renameat2(parent, tmp, parent, name, unix.RENAME_NOREPLACE); err != nil {
+		cleanup()
+		if err != unix.EEXIST {
+			return -1, err
+		}
+		existing, e := openDirAt(parent, name)
+		if e != nil {
+			return -1, e
+		}
+		if e = verifyDirOwner(existing); e != nil {
+			unix.Close(existing)
+			return -1, e
+		}
+		return existing, nil
+	}
+	if err = unix.Fsync(parent); err != nil {
 		unix.Close(fd)
 		return -1, err
 	}
 	return fd, nil
+}
+
+func openAbsoluteManagedDir(path string, create bool) (int, error) {
+	parent, name := filepath.Split(filepath.Clean(path))
+	pfd, _, err := openAbsoluteDir(parent, false)
+	if err != nil {
+		return -1, err
+	}
+	defer unix.Close(pfd)
+	fd, err := openDirAt(pfd, name)
+	if err == nil {
+		if err = verifyDirOwner(fd); err != nil {
+			unix.Close(fd)
+			return -1, err
+		}
+		return fd, nil
+	}
+	if err != unix.ENOENT || !create {
+		return -1, err
+	}
+	return publishManagedDir(pfd, name)
 }
 func createDirOwner(fd int) error {
 	var st unix.Stat_t
@@ -615,9 +774,9 @@ func openAbsoluteDir(path string, createFinal bool) (int, bool, error) {
 	for i, p := range parts {
 		next, e := openDirAt(fd, p)
 		if e == unix.ENOENT && createFinal && i == len(parts)-1 {
-			if e = unix.Mkdirat(fd, p, 0700); e == nil {
+			next, e = publishPlainDir(fd, p)
+			if e == nil {
 				created = true
-				next, e = openDirAt(fd, p)
 			}
 		}
 		unix.Close(fd)
@@ -627,6 +786,42 @@ func openAbsoluteDir(path string, createFinal bool) (int, bool, error) {
 		fd = next
 	}
 	return fd, created, nil
+}
+
+func publishPlainDir(parent int, name string) (int, error) {
+	tmp, err := randomName(".plain-dir-")
+	if err != nil {
+		return -1, err
+	}
+	if err = unix.Mkdirat(parent, tmp, 0700); err != nil {
+		return -1, err
+	}
+	fd, err := openDirAt(parent, tmp)
+	if err != nil {
+		_ = unix.Unlinkat(parent, tmp, unix.AT_REMOVEDIR)
+		return -1, err
+	}
+	if err = unix.Fsync(fd); err != nil {
+		unix.Close(fd)
+		_ = unix.Unlinkat(parent, tmp, unix.AT_REMOVEDIR)
+		return -1, err
+	}
+	if beforePlainDirPublish != nil {
+		beforePlainDirPublish(parent, tmp, name)
+	}
+	if err = unix.Renameat2(parent, tmp, parent, name, unix.RENAME_NOREPLACE); err != nil {
+		unix.Close(fd)
+		_ = unix.Unlinkat(parent, tmp, unix.AT_REMOVEDIR)
+		if err == unix.EEXIST {
+			return openDirAt(parent, name)
+		}
+		return -1, err
+	}
+	if err = unix.Fsync(parent); err != nil {
+		unix.Close(fd)
+		return -1, err
+	}
+	return fd, nil
 }
 func openAbsoluteFile(path string) (int, error) {
 	parent, name := filepath.Split(filepath.Clean(path))

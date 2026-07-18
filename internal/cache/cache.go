@@ -20,10 +20,11 @@ const ownerFile = ".dproxy-cache-owner"
 const trashName = ".dproxy-trash"
 
 var (
-	ErrUnsafeKey = errors.New("unsafe cache key")
-	ErrNotOwned  = errors.New("cache is not owned by dproxy")
-	keyPattern   = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
-	beforeDelete func(int, string) // test-only fault/race injection
+	ErrUnsafeKey     = errors.New("unsafe cache key")
+	ErrNotOwned      = errors.New("cache is not owned by dproxy")
+	keyPattern       = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	beforeDelete     func(int, string)         // test-only fault/race injection
+	beforeDirPublish func(int, string, string) // test-only publish-race injection
 )
 
 type Manager struct{ Root string }
@@ -45,14 +46,7 @@ func (m Manager) Path(projectID, pluginName, tool, compatibility, platform strin
 	defer unix.Close(rootFD)
 	fd := rootFD
 	for _, key := range keys {
-		created := unix.Mkdirat(fd, key, 0700) == nil
-		if !created {
-			var st unix.Stat_t
-			if err := unix.Fstatat(fd, key, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil || st.Mode&unix.S_IFMT != unix.S_IFDIR {
-				return "", ErrNotOwned
-			}
-		}
-		next, err := openBeneath(fd, key)
+		next, err := openOrPublishManagedDir(fd, key)
 		if err != nil {
 			return "", fmt.Errorf("open cache: %w", err)
 		}
@@ -60,15 +54,6 @@ func (m Manager) Path(projectID, pluginName, tool, compatibility, platform strin
 			unix.Close(fd)
 		}
 		fd = next
-		if created {
-			err = createMarker(fd)
-		} else {
-			err = verifyMarker(fd)
-		}
-		if err != nil {
-			unix.Close(fd)
-			return "", err
-		}
 	}
 	unix.Close(fd)
 	return filepath.Join(append([]string{filepath.Clean(m.Root)}, keys...)...), nil
@@ -137,47 +122,40 @@ func (m Manager) openRoot(create bool) (int, error) {
 	if m.Root == "" || !filepath.IsAbs(root) || root == "/" {
 		return -1, ErrUnsafeKey
 	}
-	fd, created, err := openAbsoluteDir(root, create)
+	fd, err := openAbsoluteManagedDir(root, create)
 	if err != nil {
 		if err == unix.ENOENT {
 			return -1, os.ErrNotExist
 		}
 		return -1, err
 	}
-	if created {
-		err = createMarker(fd)
-	} else {
-		err = verifyMarker(fd)
-	}
-	if err != nil {
-		unix.Close(fd)
-		return -1, err
-	}
 	return fd, nil
 }
 
-func openAbsoluteDir(path string, createFinal bool) (int, bool, error) {
+func openAbsoluteManagedDir(path string, createFinal bool) (int, error) {
 	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return -1, false, err
+		return -1, err
 	}
 	parts := strings.Split(strings.TrimPrefix(filepath.Clean(path), "/"), "/")
-	created := false
 	for i, part := range parts {
-		next, e := openBeneath(fd, part)
-		if e == unix.ENOENT && createFinal && i == len(parts)-1 {
-			if e = unix.Mkdirat(fd, part, 0700); e == nil {
-				created = true
-				next, e = openBeneath(fd, part)
+		var next int
+		var e error
+		if i == len(parts)-1 && createFinal {
+			next, e = openOrPublishManagedDir(fd, part)
+		} else {
+			next, e = openBeneath(fd, part)
+			if e == nil && i == len(parts)-1 {
+				e = verifyMarker(next)
 			}
 		}
 		unix.Close(fd)
 		if e != nil {
-			return -1, false, e
+			return -1, e
 		}
 		fd = next
 	}
-	return fd, created, nil
+	return fd, nil
 }
 
 func openBeneath(dirFD int, name string) (int, error) {
@@ -246,21 +224,65 @@ func verifyMarker(dirFD int) error {
 }
 
 func ensureTrash(rootFD int) (int, error) {
-	created := unix.Mkdirat(rootFD, trashName, 0700) == nil
-	fd, err := openBeneath(rootFD, trashName)
+	return openOrPublishManagedDir(rootFD, trashName)
+}
+
+func openOrPublishManagedDir(parentFD int, name string) (int, error) {
+	fd, err := openBeneath(parentFD, name)
+	if err == nil {
+		if err := verifyMarker(fd); err != nil {
+			unix.Close(fd)
+			return -1, err
+		}
+		return fd, nil
+	}
+	if err != unix.ENOENT {
+		return -1, err
+	}
+	tmp, err := randomName(".dir-")
 	if err != nil {
 		return -1, err
 	}
-	if created {
-		err = createMarker(fd)
-	} else {
-		err = verifyMarker(fd)
-	}
-	if err != nil {
-		unix.Close(fd)
+	if err := unix.Mkdirat(parentFD, tmp, 0700); err != nil {
 		return -1, err
 	}
-	return fd, nil
+	ownedFD, err := openBeneath(parentFD, tmp)
+	if err != nil {
+		_ = unix.Unlinkat(parentFD, tmp, unix.AT_REMOVEDIR)
+		return -1, err
+	}
+	cleanup := func() {
+		_ = unix.Unlinkat(ownedFD, ownerFile, 0)
+		_ = unix.Close(ownedFD)
+		_ = unix.Unlinkat(parentFD, tmp, unix.AT_REMOVEDIR)
+	}
+	if err := createMarker(ownedFD); err != nil {
+		cleanup()
+		return -1, err
+	}
+	if beforeDirPublish != nil {
+		beforeDirPublish(parentFD, tmp, name)
+	}
+	if err := unix.Renameat2(parentFD, tmp, parentFD, name, unix.RENAME_NOREPLACE); err != nil {
+		cleanup()
+		if err != unix.EEXIST {
+			return -1, err
+		}
+		existing, openErr := openBeneath(parentFD, name)
+		if openErr != nil {
+			return -1, openErr
+		}
+		if verifyErr := verifyMarker(existing); verifyErr != nil {
+			unix.Close(existing)
+			return -1, verifyErr
+		}
+		return existing, nil
+	}
+	if err := unix.Fsync(parentFD); err != nil {
+		unix.Close(ownedFD)
+		return -1, err
+	}
+	return ownedFD, nil
 }
 
 func randomName(prefix string) (string, error) {

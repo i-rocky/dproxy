@@ -3,6 +3,7 @@ package cache
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -170,6 +171,23 @@ func TestCacheFinalSubstitutionPreservesUnmanagedReplacement(t *testing.T) {
 		}
 	}
 	require.True(t, found)
+}
+
+func TestCacheDirectoryPublishRefusesRacerSubstitution(t *testing.T) {
+	m := newCache(t)
+	beforeDirPublish = func(parentFD int, _, final string) {
+		beforeDirPublish = nil
+		_ = unix.Mkdirat(parentFD, final, 0700)
+	}
+	t.Cleanup(func() { beforeDirPublish = nil })
+	_, err := m.Path("project", "node", "npm", "24", "linux-amd64")
+	require.ErrorIs(t, err, ErrNotOwned)
+	require.DirExists(t, m.Root)
+	entries, err := os.ReadDir(filepath.Dir(m.Root))
+	require.NoError(t, err)
+	for _, entry := range entries {
+		require.False(t, strings.HasPrefix(entry.Name(), ".dir-"))
+	}
 }
 
 func TestCleanMissingCacheFailsClosed(t *testing.T) {
