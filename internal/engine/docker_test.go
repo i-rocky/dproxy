@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"dproxy/internal/policy"
@@ -23,17 +24,21 @@ import (
 )
 
 type fakeDockerAPI struct {
-	info           system.Info
-	version        types.Version
-	lastConfig     *container.Config
-	lastHost       *container.HostConfig
-	lastNet        *network.NetworkingConfig
-	pulled         string
-	networkOptions network.CreateOptions
-	started        bool
-	removed        string
-	removeErr      error
-	listed         []types.Container
+	info            system.Info
+	version         types.Version
+	lastConfig      *container.Config
+	lastHost        *container.HostConfig
+	lastNet         *network.NetworkingConfig
+	pulled          string
+	networkOptions  network.CreateOptions
+	started         bool
+	removed         string
+	removeErr       error
+	listed          []types.Container
+	containerLabels map[string]string
+	networkLabels   map[string]string
+	resize          container.ResizeOptions
+	inspectErr      error
 }
 
 func (f *fakeDockerAPI) Info(context.Context) (system.Info, error)            { return f.info, nil }
@@ -66,6 +71,16 @@ func (f *fakeDockerAPI) ContainerWait(context.Context, string, container.WaitCon
 	return s, e
 }
 func (f *fakeDockerAPI) ContainerKill(context.Context, string, string) error { return nil }
+func (f *fakeDockerAPI) ContainerResize(_ context.Context, _ string, o container.ResizeOptions) error {
+	f.resize = o
+	return nil
+}
+func (f *fakeDockerAPI) ContainerInspect(context.Context, string) (types.ContainerJSON, error) {
+	return types.ContainerJSON{Config: &container.Config{Labels: f.containerLabels}}, f.inspectErr
+}
+func (f *fakeDockerAPI) NetworkInspect(context.Context, string, network.InspectOptions) (network.Inspect, error) {
+	return network.Inspect{Labels: f.networkLabels}, f.inspectErr
+}
 func (f *fakeDockerAPI) ContainerRemove(_ context.Context, id string, _ container.RemoveOptions) error {
 	f.removed = id
 	return f.removeErr
@@ -151,8 +166,10 @@ func TestDockerPullNetworkAndOwnedCleanup(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, api.networkOptions.Internal)
 	require.Equal(t, "true", api.networkOptions.Labels[ManagedLabel])
+	api.networkLabels = resourceLabels(n)
 	require.NoError(t, d.RemoveNetwork(context.Background(), n))
 	r := Resource{ID: "container", Ownership: Ownership{p.ProjectID, p.InvocationID}, Role: CommandRole}
+	api.containerLabels = resourceLabels(r)
 	require.NoError(t, d.RemoveContainer(context.Background(), r))
 	require.Equal(t, "container", api.removed)
 	require.Error(t, d.RemoveContainer(context.Background(), Resource{ID: "unknown"}))
@@ -197,8 +214,57 @@ func TestEngineValidationAndRedactionHelpers(t *testing.T) {
 }
 
 func TestCleanupIsIdempotentWhenResourceIsAlreadyGone(t *testing.T) {
-	api := &fakeDockerAPI{removeErr: errdefs.NotFound(errors.New("gone"))}
+	api := &fakeDockerAPI{inspectErr: errdefs.NotFound(errors.New("gone"))}
 	r := Resource{ID: "gone", Ownership: Ownership{"project", "invocation"}, Role: CommandRole}
 	require.NoError(t, NewDocker(api).RemoveContainer(context.Background(), r))
 	require.NoError(t, NewDocker(api).RemoveNetwork(context.Background(), r))
+}
+
+func TestCleanupRefusesForgedOrStaleLabels(t *testing.T) {
+	r := Resource{ID: "container", Ownership: Ownership{"project", "invocation"}, Role: CommandRole}
+	for name, labels := range map[string]map[string]string{
+		"forged project":   {ManagedLabel: "true", ProjectLabel: "other", InvocationLabel: "invocation", RoleLabel: CommandRole},
+		"stale invocation": {ManagedLabel: "true", ProjectLabel: "project", InvocationLabel: "old", RoleLabel: CommandRole},
+		"wrong role":       {ManagedLabel: "true", ProjectLabel: "project", InvocationLabel: "invocation", RoleLabel: GatewayRole},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeDockerAPI{containerLabels: labels}
+			require.ErrorContains(t, NewDocker(api).RemoveContainer(context.Background(), r), "labels")
+			require.Empty(t, api.removed)
+		})
+	}
+	n := Resource{ID: "network", Ownership: r.Ownership, Role: "network"}
+	api := &fakeDockerAPI{networkLabels: map[string]string{ManagedLabel: "true", ProjectLabel: "project", InvocationLabel: "old", RoleLabel: "network"}}
+	require.ErrorContains(t, NewDocker(api).RemoveNetwork(context.Background(), n), "labels")
+	require.Empty(t, api.removed)
+}
+
+func TestDockerResizeMapsHeightAndWidth(t *testing.T) {
+	api := &fakeDockerAPI{}
+	require.NoError(t, NewDocker(api).Resize(context.Background(), "command", 40, 120))
+	require.Equal(t, container.ResizeOptions{Height: 40, Width: 120}, api.resize)
+}
+
+func TestDockerNeverSendsWINCHThroughContainerKill(t *testing.T) {
+	require.ErrorContains(t, NewDocker(&fakeDockerAPI{}).Signal(context.Background(), "command", syscall.SIGWINCH), "resize")
+}
+
+type closedWaitAPI struct{}
+
+func (closedWaitAPI) ContainerWait(context.Context, string, container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+	status := make(chan container.WaitResponse, 1)
+	errs := make(chan error)
+	close(errs)
+	status <- container.WaitResponse{StatusCode: 29}
+	close(status)
+	return status, errs
+}
+func TestWaitIgnoresClosedErrorChannel(t *testing.T) {
+	code, err := NewDocker(closedWaitAPI{}).Wait(context.Background(), "command")
+	require.NoError(t, err)
+	require.Equal(t, 29, code)
+}
+
+func resourceLabels(r Resource) map[string]string {
+	return map[string]string{ManagedLabel: "true", ProjectLabel: r.Ownership.ProjectID, InvocationLabel: r.Ownership.InvocationID, RoleLabel: r.Role}
 }

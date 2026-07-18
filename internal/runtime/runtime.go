@@ -26,6 +26,7 @@ type IO struct {
 	Stdout, Stderr io.Writer
 	TTY            bool
 	MakeRaw        func() (func() error, error)
+	TerminalSize   func() (height, width uint, err error)
 }
 
 func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (exitCode int, setupErr error) {
@@ -88,13 +89,25 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 		return 0, fmt.Errorf("attach command: %w", err)
 	}
 	defer attachment.Close()
+	if streams.TTY {
+		if streams.TerminalSize == nil {
+			return 0, errors.New("TTY size source is required")
+		}
+		if err := resize(ctx, deps.Engine, command.ID, streams.TerminalSize); err != nil {
+			return 0, err
+		}
+	}
 	signals, stop := signalChannel(deps.Signals)
 	defer stop()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for sig := range signals {
-			if supportedSignal(sig) {
+			if sig == syscall.SIGWINCH {
+				if streams.TTY {
+					_ = resize(context.WithoutCancel(ctx), deps.Engine, command.ID, streams.TerminalSize)
+				}
+			} else if supportedSignal(sig) {
 				_ = deps.Engine.Signal(context.WithoutCancel(ctx), command.ID, sig)
 			}
 		}
@@ -153,7 +166,17 @@ func signalChannel(in <-chan os.Signal) (<-chan os.Signal, func()) {
 	}
 }
 func supportedSignal(sig os.Signal) bool {
-	return sig == syscall.SIGINT || sig == syscall.SIGTERM || sig == syscall.SIGWINCH
+	return sig == syscall.SIGINT || sig == syscall.SIGTERM
+}
+func resize(ctx context.Context, e engine.Engine, id string, size func() (uint, uint, error)) error {
+	height, width, err := size()
+	if err != nil {
+		return fmt.Errorf("query terminal size: %w", err)
+	}
+	if err = e.Resize(ctx, engine.ContainerID(id), height, width); err != nil {
+		return fmt.Errorf("resize command terminal: %w", err)
+	}
+	return nil
 }
 func cleanup(ctx context.Context, e engine.Engine, resources []engine.Resource) error {
 	var errs []error

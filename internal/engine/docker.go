@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"dproxy/internal/policy"
 
@@ -251,17 +252,49 @@ func (d *Docker) Wait(ctx context.Context, id string) (int, error) {
 		return 0, errors.New("engine does not provide wait API")
 	}
 	status, errs := a.ContainerWait(ctx, id, container.WaitConditionNotRunning)
-	select {
-	case err := <-errs:
-		return 0, fmt.Errorf("wait for command container: %w", err)
-	case s := <-status:
-		if s.Error != nil {
-			return int(s.StatusCode), errors.New("command wait failed")
+	for status != nil || errs != nil {
+		select {
+		case err, ok := <-errs:
+			if !ok {
+				errs = nil
+				continue
+			}
+			if err == nil {
+				return 0, errors.New("wait for command container returned an empty error")
+			}
+			return 0, fmt.Errorf("wait for command container: %w", err)
+		case s, ok := <-status:
+			if !ok {
+				status = nil
+				continue
+			}
+			if s.Error != nil {
+				return int(s.StatusCode), errors.New("command wait failed")
+			}
+			return int(s.StatusCode), nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
 		}
-		return int(s.StatusCode), nil
-	case <-ctx.Done():
-		return 0, ctx.Err()
 	}
+	return 0, errors.New("wait for command container closed without status")
+}
+
+type resizeAPI interface {
+	ContainerResize(context.Context, string, container.ResizeOptions) error
+}
+
+func (d *Docker) Resize(ctx context.Context, id ContainerID, height, width uint) error {
+	if id == "" || height == 0 || width == 0 {
+		return errors.New("invalid terminal resize")
+	}
+	a, ok := d.api.(resizeAPI)
+	if !ok {
+		return errors.New("engine does not provide resize API")
+	}
+	if err := a.ContainerResize(ctx, string(id), container.ResizeOptions{Height: height, Width: width}); err != nil {
+		return fmt.Errorf("resize command terminal: %w", err)
+	}
+	return nil
 }
 
 type signalAPI interface {
@@ -269,6 +302,9 @@ type signalAPI interface {
 }
 
 func (d *Docker) Signal(ctx context.Context, id string, s os.Signal) error {
+	if s == syscall.SIGWINCH {
+		return errors.New("SIGWINCH requires terminal resize")
+	}
 	a, ok := d.api.(signalAPI)
 	if !ok {
 		return errors.New("engine does not provide signal API")
@@ -277,6 +313,7 @@ func (d *Docker) Signal(ctx context.Context, id string, s os.Signal) error {
 }
 
 type removeAPI interface {
+	ContainerInspect(context.Context, string) (types.ContainerJSON, error)
 	ContainerRemove(context.Context, string, container.RemoveOptions) error
 }
 
@@ -288,7 +325,17 @@ func (d *Docker) RemoveContainer(ctx context.Context, r Resource) error {
 	if !ok {
 		return errors.New("engine does not provide container removal API")
 	}
-	err := a.ContainerRemove(ctx, r.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
+	inspected, err := a.ContainerInspect(ctx, r.ID)
+	if errdefs.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect owned container: %w", err)
+	}
+	if inspected.Config == nil || !labelsMatch(inspected.Config.Labels, r) {
+		return errors.New("refusing to remove container with mismatched ownership labels")
+	}
+	err = a.ContainerRemove(ctx, r.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
 	if errdefs.IsNotFound(err) {
 		return nil
 	}
@@ -296,6 +343,7 @@ func (d *Docker) RemoveContainer(ctx context.Context, r Resource) error {
 }
 
 type removeNetworkAPI interface {
+	NetworkInspect(context.Context, string, network.InspectOptions) (network.Inspect, error)
 	NetworkRemove(context.Context, string) error
 }
 
@@ -307,11 +355,24 @@ func (d *Docker) RemoveNetwork(ctx context.Context, r Resource) error {
 	if !ok {
 		return errors.New("engine does not provide network removal API")
 	}
-	err := a.NetworkRemove(ctx, r.ID)
+	inspected, err := a.NetworkInspect(ctx, r.ID, network.InspectOptions{})
+	if errdefs.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect owned network: %w", err)
+	}
+	if !labelsMatch(inspected.Labels, r) {
+		return errors.New("refusing to remove network with mismatched ownership labels")
+	}
+	err = a.NetworkRemove(ctx, r.ID)
 	if errdefs.IsNotFound(err) {
 		return nil
 	}
 	return err
+}
+func labelsMatch(labels map[string]string, r Resource) bool {
+	return labels[ManagedLabel] == "true" && labels[ProjectLabel] == r.Ownership.ProjectID && labels[InvocationLabel] == r.Ownership.InvocationID && labels[RoleLabel] == r.Role
 }
 func validateResource(r Resource) error {
 	if r.ID == "" || r.Ownership.ProjectID == "" || r.Ownership.InvocationID == "" {

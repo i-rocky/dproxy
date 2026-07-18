@@ -22,6 +22,7 @@ type Resource struct {
 	Ownership Ownership
 	Role      string
 }
+type ContainerID string
 
 type Ownership struct {
 	ProjectID, InvocationID string
@@ -47,6 +48,7 @@ type Engine interface {
 	StartCommand(context.Context, policy.Plan, string, bool) (Resource, error)
 	Attach(context.Context, string, IO) (Attachment, error)
 	Wait(context.Context, string) (int, error)
+	Resize(context.Context, ContainerID, uint, uint) error
 	Signal(context.Context, string, os.Signal) error
 	RemoveContainer(context.Context, Resource) error
 	RemoveNetwork(context.Context, Resource) error

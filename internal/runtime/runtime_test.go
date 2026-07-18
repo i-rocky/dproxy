@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -51,6 +52,10 @@ func (f *fakeEngine) Wait(context.Context, string) (int, error) {
 	return f.exit, f.waitErr
 }
 func (f *fakeEngine) Signal(context.Context, string, os.Signal) error { f.call("signal"); return nil }
+func (f *fakeEngine) Resize(_ context.Context, _ engine.ContainerID, height, width uint) error {
+	f.call(fmt.Sprintf("resize-%dx%d", height, width))
+	return nil
+}
 func (f *fakeEngine) RemoveContainer(context.Context, engine.Resource) error {
 	f.call("remove-" + f.resourceRole())
 	return f.removeErr
@@ -121,7 +126,7 @@ func TestRunRelaysSignals(t *testing.T) {
 func TestRunRestoresTTYAndReportsCleanupFailure(t *testing.T) {
 	restored := false
 	f := &fakeEngine{removeErr: errors.New("remove failed")}
-	code, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}}, runtimePlan("none"), IO{Stdin: bytes.NewReader(nil), Stdout: io.Discard, Stderr: io.Discard, TTY: true, MakeRaw: func() (func() error, error) { return func() error { restored = true; return nil }, nil }})
+	code, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}}, runtimePlan("none"), IO{Stdin: bytes.NewReader(nil), Stdout: io.Discard, Stderr: io.Discard, TTY: true, MakeRaw: func() (func() error, error) { return func() error { restored = true; return nil }, nil }, TerminalSize: func() (uint, uint, error) { return 24, 80, nil }})
 	require.Zero(t, code)
 	require.ErrorContains(t, err, "cleanup")
 	require.True(t, restored)
@@ -147,4 +152,18 @@ func TestRunDoesNotRequireCallerToCloseSignalChannel(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Run blocked waiting for caller-owned signal channel")
 	}
+}
+
+func TestRunResizesTTYInitiallyAndOnWINCHWithoutSendingSignal(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	signals <- syscall.SIGWINCH
+	close(signals)
+	sizes := [][2]uint{{24, 80}, {40, 120}}
+	var i int
+	f := &fakeEngine{waitDelay: 10 * time.Millisecond}
+	_, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Signals: signals}, runtimePlan("none"), IO{TTY: true, MakeRaw: func() (func() error, error) { return func() error { return nil }, nil }, TerminalSize: func() (uint, uint, error) { size := sizes[i]; i++; return size[0], size[1], nil }})
+	require.NoError(t, err)
+	require.Contains(t, f.calls, "resize-24x80")
+	require.Contains(t, f.calls, "resize-40x120")
+	require.NotContains(t, f.calls, "signal")
 }
