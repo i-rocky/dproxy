@@ -40,6 +40,8 @@ type fakeDockerAPI struct {
 	resize          container.ResizeOptions
 	inspectErr      error
 	killedSignal    string
+	execOptions     container.ExecOptions
+	execExit        int
 }
 
 func (f *fakeDockerAPI) Info(context.Context) (system.Info, error)            { return f.info, nil }
@@ -95,6 +97,16 @@ func (f *fakeDockerAPI) NetworkRemove(_ context.Context, id string) error {
 }
 func (f *fakeDockerAPI) ContainerList(context.Context, container.ListOptions) ([]types.Container, error) {
 	return f.listed, nil
+}
+func (f *fakeDockerAPI) ContainerExecCreate(_ context.Context, _ string, o container.ExecOptions) (types.IDResponse, error) {
+	f.execOptions = o
+	return types.IDResponse{ID: "exec"}, nil
+}
+func (f *fakeDockerAPI) ContainerExecStart(context.Context, string, container.ExecStartOptions) error {
+	return nil
+}
+func (f *fakeDockerAPI) ContainerExecInspect(context.Context, string) (container.ExecInspect, error) {
+	return container.ExecInspect{ExitCode: f.execExit}, nil
 }
 
 func lockedDownPlan() policy.Plan {
@@ -179,6 +191,41 @@ func TestDockerPullNetworkAndOwnedCleanup(t *testing.T) {
 	require.Error(t, d.RemoveContainer(context.Background(), Resource{ID: "unknown"}))
 }
 
+func TestDockerStartsOnlyGatewayWithNarrowNetworkCapability(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := dir + "/policy.json"
+	require.NoError(t, os.WriteFile(policyPath, []byte(`{"mode":"public"}`), 0400))
+	api := &fakeDockerAPI{}
+	ownership := Ownership{"project", "invocation"}
+	r, err := NewDocker(api).StartGateway(context.Background(), GatewaySpec{Image: "repo/gateway@sha256:" + strings.Repeat("a", 64), PolicyPath: policyPath, HealthToken: "token", InternalNetworkID: "internal", EgressNetworkID: "bridge", Ownership: ownership, Ports: []policy.Port{{Host: 3000, Container: 8080}}})
+	require.NoError(t, err)
+	require.Equal(t, GatewayRole, r.Role)
+	require.True(t, api.started)
+	require.Equal(t, []string{"ALL"}, []string(api.lastHost.CapDrop))
+	require.Equal(t, []string{"NET_ADMIN"}, []string(api.lastHost.CapAdd))
+	require.False(t, api.lastHost.Privileged)
+	require.Len(t, api.lastNet.EndpointsConfig, 2)
+	require.True(t, api.lastHost.ReadonlyRootfs)
+	require.True(t, api.lastHost.Mounts[0].ReadOnly)
+	require.Equal(t, "3000", api.lastHost.PortBindings["8080/tcp"][0].HostPort)
+	api.containerLabels = resourceLabels(r)
+	require.NoError(t, NewDocker(api).GatewayHealth(context.Background(), r, "token"))
+	require.Equal(t, []string{"/gateway", "health"}, api.execOptions.Cmd)
+}
+
+func TestDockerCommandSharesGatewayNetworkNamespaceWithoutCapabilities(t *testing.T) {
+	p := lockedDownPlan()
+	p.Network.Mode = "public"
+	p.Ports = []policy.Port{{Host: 3000, Container: 8080}}
+	api := &fakeDockerAPI{}
+	_, err := NewDocker(api).StartCommand(context.Background(), p, "gateway-id", false)
+	require.NoError(t, err)
+	require.Equal(t, container.NetworkMode("container:gateway-id"), api.lastHost.NetworkMode)
+	require.Nil(t, api.lastNet)
+	require.Empty(t, api.lastHost.CapAdd)
+	require.Empty(t, api.lastHost.PortBindings)
+}
+
 func TestDockerAttachStartsOnlyAfterAttachAndPreservesExit(t *testing.T) {
 	api := &fakeDockerAPI{}
 	a, err := NewDocker(api).Attach(context.Background(), "command", IO{Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard})
@@ -209,7 +256,7 @@ func TestEngineValidationAndRedactionHelpers(t *testing.T) {
 	p := lockedDownPlan()
 	_, err := NewDocker(api).CreateNetwork(context.Background(), p)
 	require.Error(t, err)
-	_, err = NewDocker(api).StartGateway(context.Background(), p, "network")
+	_, err = NewDocker(api).StartGateway(context.Background(), GatewaySpec{})
 	require.Error(t, err)
 	require.Equal(t, "failure [redacted]", redact(errors.New("failure sensitive"), map[string]string{"TOKEN": "sensitive"}).Error())
 	require.Less(t, compareAPIVersion("1.39", "1.40"), 0)

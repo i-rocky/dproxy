@@ -22,6 +22,12 @@ type Resource struct {
 	Ownership Ownership
 	Role      string
 }
+type GatewaySpec struct {
+	Image, PolicyPath, HealthToken     string
+	InternalNetworkID, EgressNetworkID string
+	Ownership                          Ownership
+	Ports                              []policy.Port
+}
 type ContainerID string
 
 type Ownership struct {
@@ -44,7 +50,8 @@ type Engine interface {
 	Verify(context.Context) error
 	PullByDigest(context.Context, string) error
 	CreateNetwork(context.Context, policy.Plan) (Resource, error)
-	StartGateway(context.Context, policy.Plan, string) (Resource, error)
+	StartGateway(context.Context, GatewaySpec) (Resource, error)
+	GatewayHealth(context.Context, Resource, string) error
 	StartCommand(context.Context, policy.Plan, string, bool) (Resource, error)
 	Attach(context.Context, string, IO) (Attachment, error)
 	Wait(context.Context, string) (int, error)

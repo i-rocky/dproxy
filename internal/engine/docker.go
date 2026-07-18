@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -113,18 +115,9 @@ func (d *Docker) StartCommand(ctx context.Context, p policy.Plan, networkID stri
 	for _, tmp := range p.Tmpfs {
 		host.Tmpfs[tmp.Target] = fmt.Sprintf("rw,nosuid,nodev,mode=%04o", tmp.Mode.Perm())
 	}
-	ports := make(nat.PortSet)
-	bindings := make(nat.PortMap)
-	for _, port := range p.Ports {
-		cp := nat.Port(strconv.Itoa(port.Container) + "/tcp")
-		ports[cp] = struct{}{}
-		bindings[cp] = []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: strconv.Itoa(port.Host)}}
-	}
-	cfg.ExposedPorts, host.PortBindings = ports, bindings
 	var netCfg *network.NetworkingConfig
 	if networkID != "" {
-		host.NetworkMode = container.NetworkMode(networkID)
-		netCfg = &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{networkID: {NetworkID: networkID}}}
+		host.NetworkMode = container.NetworkMode("container:" + networkID)
 	}
 	created, err := a.ContainerCreate(ctx, cfg, host, netCfg, nil, "")
 	if err != nil {
@@ -174,6 +167,34 @@ func ownershipLabels(p policy.Plan, role string) map[string]string {
 type networkAPI interface {
 	NetworkCreate(context.Context, string, network.CreateOptions) (network.CreateResponse, error)
 }
+type activeNetworkAPI interface {
+	NetworkList(context.Context, network.ListOptions) ([]network.Summary, error)
+}
+
+func (d *Docker) ActiveDockerSubnets(ctx context.Context) ([]netip.Prefix, error) {
+	a, ok := d.api.(activeNetworkAPI)
+	if !ok {
+		return nil, errors.New("engine does not provide active network discovery")
+	}
+	items, err := a.NetworkList(ctx, network.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list active Docker networks: %w", err)
+	}
+	var out []netip.Prefix
+	for _, item := range items {
+		for _, cfg := range item.IPAM.Config {
+			if cfg.Subnet == "" {
+				continue
+			}
+			p, e := netip.ParsePrefix(cfg.Subnet)
+			if e != nil {
+				return nil, errors.New("Docker reported an invalid active subnet")
+			}
+			out = append(out, p.Masked())
+		}
+	}
+	return out, nil
+}
 
 func (d *Docker) CreateNetwork(ctx context.Context, p policy.Plan) (Resource, error) {
 	if p.ProjectID == "" || p.InvocationID == "" || p.Network.Mode == "none" {
@@ -191,8 +212,89 @@ func (d *Docker) CreateNetwork(ctx context.Context, p policy.Plan) (Resource, er
 	return Resource{ID: r.ID, Ownership: Ownership{p.ProjectID, p.InvocationID}, Role: "network"}, nil
 }
 
-func (d *Docker) StartGateway(context.Context, policy.Plan, string) (Resource, error) {
-	return Resource{}, errors.New("gateway configuration is not available")
+type gatewayAPI interface {
+	createAPI
+	ContainerStart(context.Context, string, container.StartOptions) error
+}
+
+func (d *Docker) StartGateway(ctx context.Context, s GatewaySpec) (Resource, error) {
+	if !digestReference(s.Image) || s.HealthToken == "" || s.InternalNetworkID == "" || s.EgressNetworkID == "" || s.InternalNetworkID == s.EgressNetworkID {
+		return Resource{}, errors.New("invalid gateway specification")
+	}
+	if s.Ownership.ProjectID == "" || s.Ownership.InvocationID == "" {
+		return Resource{}, errors.New("missing gateway ownership")
+	}
+	info, err := os.Lstat(s.PolicyPath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0222 != 0 {
+		return Resource{}, errors.New("gateway policy is not a read-only regular file")
+	}
+	a, ok := d.api.(gatewayAPI)
+	if !ok {
+		return Resource{}, errors.New("engine does not provide gateway create API")
+	}
+	labels := map[string]string{ManagedLabel: "true", ProjectLabel: s.Ownership.ProjectID, InvocationLabel: s.Ownership.InvocationID, RoleLabel: GatewayRole}
+	cfg := &container.Config{Image: s.Image, Cmd: []string{"/gateway", "serve", "--policy", "/etc/dproxy/policy.json"}, Env: []string{"DPROXY_HEALTH_TOKEN=" + s.HealthToken, "DPROXY_DNS_UPSTREAM=127.0.0.11:53"}, Labels: labels}
+	host := &container.HostConfig{NetworkMode: container.NetworkMode(s.InternalNetworkID), AutoRemove: true, ReadonlyRootfs: true, CapDrop: []string{"ALL"}, CapAdd: []string{"NET_ADMIN"}, SecurityOpt: []string{"no-new-privileges"}, Sysctls: map[string]string{"net.ipv4.ip_forward": "1", "net.ipv6.conf.all.forwarding": "1"}, Mounts: []mount.Mount{{Type: mount.TypeBind, Source: filepath.Clean(s.PolicyPath), Target: "/etc/dproxy/policy.json", ReadOnly: true}}, Tmpfs: map[string]string{"/run": "rw,nosuid,nodev,noexec,mode=0700"}}
+	ports := make(nat.PortSet)
+	bindings := make(nat.PortMap)
+	for _, port := range s.Ports {
+		if port.Host < 1 || port.Host > 65535 || port.Container < 1 || port.Container > 65535 {
+			return Resource{}, errors.New("invalid gateway published port")
+		}
+		cp := nat.Port(strconv.Itoa(port.Container) + "/tcp")
+		ports[cp] = struct{}{}
+		bindings[cp] = []nat.PortBinding{{HostIP: "127.0.0.1", HostPort: strconv.Itoa(port.Host)}}
+	}
+	cfg.ExposedPorts, host.PortBindings = ports, bindings
+	netCfg := &network.NetworkingConfig{EndpointsConfig: map[string]*network.EndpointSettings{s.InternalNetworkID: {NetworkID: s.InternalNetworkID}, s.EgressNetworkID: {NetworkID: s.EgressNetworkID}}}
+	created, err := a.ContainerCreate(ctx, cfg, host, netCfg, nil, "")
+	if err != nil {
+		return Resource{}, fmt.Errorf("create gateway container: %w", err)
+	}
+	r := Resource{ID: created.ID, Ownership: s.Ownership, Role: GatewayRole}
+	if err = a.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+		return r, fmt.Errorf("start gateway container: %w", err)
+	}
+	return r, nil
+}
+
+type gatewayHealthAPI interface {
+	ContainerInspect(context.Context, string) (types.ContainerJSON, error)
+	ContainerExecCreate(context.Context, string, container.ExecOptions) (types.IDResponse, error)
+	ContainerExecStart(context.Context, string, container.ExecStartOptions) error
+	ContainerExecInspect(context.Context, string) (container.ExecInspect, error)
+}
+
+func (d *Docker) GatewayHealth(ctx context.Context, r Resource, token string) error {
+	if err := validateResource(r); err != nil || r.Role != GatewayRole || token == "" {
+		return errors.New("invalid gateway health request")
+	}
+	a, ok := d.api.(gatewayHealthAPI)
+	if !ok {
+		return errors.New("engine does not provide gateway health API")
+	}
+	inspected, err := a.ContainerInspect(ctx, r.ID)
+	if err != nil {
+		return fmt.Errorf("inspect gateway health target: %w", err)
+	}
+	if inspected.Config == nil || !labelsMatch(inspected.Config.Labels, r) {
+		return errors.New("gateway health target ownership mismatch")
+	}
+	exec, err := a.ContainerExecCreate(ctx, r.ID, container.ExecOptions{Cmd: []string{"/gateway", "health"}, Env: []string{"DPROXY_HEALTH_PROBE=" + token}})
+	if err != nil {
+		return fmt.Errorf("create gateway health probe: %w", err)
+	}
+	if err = a.ContainerExecStart(ctx, exec.ID, container.ExecStartOptions{}); err != nil {
+		return fmt.Errorf("run gateway health probe: %w", err)
+	}
+	status, err := a.ContainerExecInspect(ctx, exec.ID)
+	if err != nil {
+		return fmt.Errorf("inspect gateway health probe: %w", err)
+	}
+	if status.Running || status.ExitCode != 0 {
+		return errors.New("gateway health probe failed")
+	}
+	return nil
 }
 
 type attachAPI interface {

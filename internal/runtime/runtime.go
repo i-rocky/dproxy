@@ -18,6 +18,7 @@ const defaultCleanupTimeout = 10 * time.Second
 
 type Dependencies struct {
 	Engine         engine.Engine
+	Gateway        engine.GatewaySpec
 	Signals        <-chan os.Signal
 	CleanupTimeout time.Duration
 }
@@ -52,6 +53,7 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 		return 0, fmt.Errorf("prepare locked image: %w", err)
 	}
 	var networkID string
+	var commandNetworkTarget string
 	if plan.Network.Mode != "none" {
 		network, err := deps.Engine.CreateNetwork(ctx, plan)
 		if err != nil {
@@ -59,13 +61,21 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 		}
 		resources = append(resources, network)
 		networkID = network.ID
-		gateway, err := deps.Engine.StartGateway(ctx, plan, networkID)
+		spec := deps.Gateway
+		spec.InternalNetworkID = networkID
+		spec.Ownership = engine.Ownership{ProjectID: plan.ProjectID, InvocationID: plan.InvocationID}
+		spec.Ports = append([]policy.Port(nil), plan.Ports...)
+		gateway, err := deps.Engine.StartGateway(ctx, spec)
 		if err != nil {
 			return 0, fmt.Errorf("start filtering gateway: %w", err)
 		}
 		resources = append(resources, gateway)
+		if err = deps.Engine.GatewayHealth(ctx, gateway, spec.HealthToken); err != nil {
+			return 0, fmt.Errorf("authenticate filtering gateway: %w", err)
+		}
+		commandNetworkTarget = gateway.ID
 	}
-	command, err := deps.Engine.StartCommand(ctx, plan, networkID, streams.TTY)
+	command, err := deps.Engine.StartCommand(ctx, plan, commandNetworkTarget, streams.TTY)
 	if err != nil {
 		return 0, fmt.Errorf("create command: %w", err)
 	}

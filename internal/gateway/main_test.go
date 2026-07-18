@@ -1,0 +1,172 @@
+package gateway
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+type fakeControls struct {
+	calls []string
+	fail  string
+}
+
+func TestServePublishesAuthenticatedReadinessOnlyAfterControls(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "policy.json")
+	ready := filepath.Join(dir, "ready")
+	require.NoError(t, os.WriteFile(policyPath, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, policyPath, ready, &fakeControls{}) }()
+	require.Eventually(t, func() bool { return Health(ready, "token", "token") == nil }, time.Second, time.Millisecond)
+	require.Error(t, Health(ready, "token", "wrong"))
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestServeDoesNotPublishReadinessOnSetupFailure(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "policy.json")
+	ready := filepath.Join(dir, "ready")
+	require.NoError(t, os.WriteFile(policyPath, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
+	require.Error(t, Serve(context.Background(), policyPath, ready, &fakeControls{fail: "udp"}))
+	_, err := os.Stat(ready)
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+type fakeInspector struct {
+	fail  string
+	calls []string
+}
+
+func (f *fakeInspector) Forwarding(s string) error {
+	f.calls = append(f.calls, s)
+	if f.fail == s {
+		return errors.New("bad")
+	}
+	return nil
+}
+func (f *fakeInspector) DNS(n, _ string) error {
+	f.calls = append(f.calls, n)
+	if f.fail == n {
+		return errors.New("bad")
+	}
+	return nil
+}
+func (f *fakeInspector) NFT() error {
+	f.calls = append(f.calls, "nft")
+	if f.fail == "nft" {
+		return errors.New("bad")
+	}
+	return nil
+}
+func TestSystemHealthRequiresEveryIndependentControl(t *testing.T) {
+	for _, fail := range []string{"ipv4", "ipv6", "tcp", "udp", "nft"} {
+		f := &fakeInspector{fail: fail}
+		require.Error(t, VerifySystemHealth(f, "dns"), fail)
+	}
+	f := &fakeInspector{}
+	require.NoError(t, VerifySystemHealth(f, "dns"))
+	require.Equal(t, []string{"ipv4", "ipv6", "tcp", "udp", "nft"}, f.calls)
+	require.Error(t, VerifySystemHealth(nil, "dns"))
+}
+func TestRealHealthAdaptersFailClosedWithoutControls(t *testing.T) {
+	i := realHealthInspector{}
+	_ = i.Forwarding("ipv4")
+	_ = i.Forwarding("ipv6")
+	require.Error(t, i.DNS("tcp", "127.0.0.1:1"))
+	require.Error(t, i.DNS("udp", "127.0.0.1:1"))
+	require.Error(t, i.NFT())
+}
+func TestSystemHealthChecksPolicyHashBeforeKernel(t *testing.T) {
+	dir := t.TempDir()
+	policy := filepath.Join(dir, "policy")
+	ready := filepath.Join(dir, "ready")
+	require.NoError(t, os.WriteFile(policy, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ServeWithToken(ctx, policy, ready, "token", &fakeControls{}) }()
+	require.Eventually(t, func() bool { _, e := os.Stat(ready); return e == nil }, time.Second, time.Millisecond)
+	require.NoError(t, os.Chmod(policy, 0600))
+	require.NoError(t, os.WriteFile(policy, []byte("changed"), 0600))
+	require.ErrorContains(t, SystemHealth(ready, policy, "token", "token", "127.0.0.1:1"), "hash")
+	cancel()
+	<-done
+}
+
+func (f *fakeControls) InstallDNS(context.Context) error {
+	f.calls = append(f.calls, "dns")
+	if f.fail == "dns" {
+		return errors.New("bad")
+	}
+	return nil
+}
+func (f *fakeControls) InstallTCP(context.Context) error {
+	f.calls = append(f.calls, "tcp")
+	if f.fail == "tcp" {
+		return errors.New("bad")
+	}
+	return nil
+}
+func (f *fakeControls) InstallUDP(context.Context) error {
+	f.calls = append(f.calls, "udp")
+	if f.fail == "udp" {
+		return errors.New("bad")
+	}
+	return nil
+}
+func (f *fakeControls) InstallFirewall(context.Context) error {
+	f.calls = append(f.calls, "firewall")
+	if f.fail == "firewall" {
+		return errors.New("bad")
+	}
+	return nil
+}
+
+func TestSetupFailsUnlessEveryTransparentControlIsInstalled(t *testing.T) {
+	for _, control := range []string{"dns", "tcp", "udp", "firewall"} {
+		f := &fakeControls{fail: control}
+		err := InstallControls(context.Background(), f)
+		require.Error(t, err, control)
+	}
+	f := &fakeControls{}
+	require.NoError(t, InstallControls(context.Background(), f))
+	require.Equal(t, []string{"dns", "tcp", "udp", "firewall"}, f.calls)
+}
+
+func TestLoadPolicyRequiresReadOnlyRegularJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policy.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
+	p, err := LoadPolicy(path)
+	require.NoError(t, err)
+	require.Equal(t, "public", p.Mode)
+	require.NoError(t, os.Chmod(path, 0600))
+	_, err = LoadPolicy(path)
+	require.ErrorContains(t, err, "read-only")
+	require.NoError(t, os.WriteFile(path, []byte(`{"mode":"public","unknown":true}`), 0600))
+	require.NoError(t, os.Chmod(path, 0400))
+	_, err = LoadPolicy(path)
+	require.Error(t, err)
+}
+func TestLoadPolicyRejectsEveryIncompleteState(t *testing.T) {
+	dir := t.TempDir()
+	_, err := LoadPolicy(filepath.Join(dir, "missing"))
+	require.Error(t, err)
+	_, err = LoadPolicy(dir)
+	require.Error(t, err)
+	for _, body := range []string{`{"mode":"none","denied_prefixes":["127.0.0.0/8"]}`, `{"mode":"allowlist","denied_prefixes":["127.0.0.0/8"]}`, `{"mode":"public"}`, `{"mode":"public","denied_prefixes":["bad"]}`, `{"mode":"public","denied_prefixes":["127.0.0.0/8"]} {}`} {
+		path := filepath.Join(dir, "p")
+		require.NoError(t, os.WriteFile(path, []byte(body), 0600))
+		require.NoError(t, os.Chmod(path, 0400))
+		_, err = LoadPolicy(path)
+		require.Error(t, err)
+		require.NoError(t, os.Chmod(path, 0600))
+	}
+}

@@ -34,9 +34,13 @@ func (f *fakeEngine) CreateNetwork(context.Context, policy.Plan) (engine.Resourc
 	f.call("create-network")
 	return engine.Resource{ID: "network", Role: "network"}, nil
 }
-func (f *fakeEngine) StartGateway(context.Context, policy.Plan, string) (engine.Resource, error) {
+func (f *fakeEngine) StartGateway(context.Context, engine.GatewaySpec) (engine.Resource, error) {
 	f.call("start-gateway")
 	return engine.Resource{ID: "gateway", Role: engine.GatewayRole}, nil
+}
+func (f *fakeEngine) GatewayHealth(context.Context, engine.Resource, string) error {
+	f.call("gateway-health")
+	return nil
 }
 func (f *fakeEngine) StartCommand(context.Context, policy.Plan, string, bool) (engine.Resource, error) {
 	f.call("create-command")
@@ -94,7 +98,7 @@ func TestRunReturnsExitAndCleansUp(t *testing.T) {
 	code, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, CleanupTimeout: time.Second}, runtimePlan("public"), testIO())
 	require.NoError(t, err)
 	require.Equal(t, 42, code)
-	require.Equal(t, []string{"verify", "pull", "create-network", "start-gateway", "create-command", "attach-start", "wait", "remove-command", "remove-gateway", "remove-network"}, f.calls)
+	require.Equal(t, []string{"verify", "pull", "create-network", "start-gateway", "gateway-health", "create-command", "attach-start", "wait", "remove-command", "remove-gateway", "remove-network"}, f.calls)
 }
 
 func TestRunCleansWithBoundedFreshContextAfterCancellation(t *testing.T) {
