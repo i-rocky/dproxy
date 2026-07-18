@@ -3,9 +3,9 @@ package config
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"os"
 
+	"dproxy/internal/fault"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -30,7 +30,7 @@ type Sandbox struct {
 func Load(path string) (Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return Config{}, fmt.Errorf("read configuration: %w", err)
+		return Config{}, fault.New("load configuration", "read failed", err)
 	}
 	var c Config
 	dec := toml.NewDecoder(bytes.NewReader(raw))
@@ -38,19 +38,19 @@ func Load(path string) (Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		var unknown *toml.StrictMissingError
 		if errors.As(err, &unknown) {
-			return Config{}, fmt.Errorf("decode configuration: unknown field: %w", err)
+			return Config{}, fault.New("load configuration", "unknown field", err)
 		}
-		return Config{}, fmt.Errorf("decode configuration: %w", err)
+		return Config{}, fault.New("load configuration", "malformed TOML", err)
 	}
 	if c.Schema != 1 {
-		return Config{}, ErrSchema
+		return Config{}, fault.New("load configuration", "unsupported schema", ErrSchema)
 	}
 	return c, validate(c)
 }
 
 func validate(c Config) error {
 	if c.Sandbox.Network != "" && c.Sandbox.Network != "none" && c.Sandbox.Network != "public" && c.Sandbox.Network != "allowlist" {
-		return errors.New("invalid sandbox network policy")
+		return fault.New("validate configuration", "invalid sandbox network policy", nil)
 	}
 	return nil
 }

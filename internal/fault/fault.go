@@ -10,6 +10,10 @@ type Error struct {
 	Err  error
 }
 
+func New(op, kind string, err error) *Error {
+	return &Error{Op: op, Kind: kind, Err: err}
+}
+
 func (e *Error) Error() string {
 	return fmt.Sprintf("%s: %s", e.Op, e.Kind)
 }
