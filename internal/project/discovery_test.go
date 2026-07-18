@@ -21,6 +21,29 @@ func TestFindNearestProject(t *testing.T) {
 	require.Len(t, p.ID, 32)
 }
 
+func TestFindResolvesIntermediateSymlinkWithinProject(t *testing.T) {
+	root := projectRoot(t)
+	physical := filepath.Join(root, "physical", "nested")
+	require.NoError(t, os.MkdirAll(physical, 0755))
+	require.NoError(t, os.Symlink(filepath.Join(root, "physical"), filepath.Join(root, "alias")))
+
+	p, err := Find(filepath.Join(root, "alias", "nested"))
+	require.NoError(t, err)
+	require.Equal(t, root, p.Root)
+	require.Equal(t, "physical/nested", p.RelativeWorkdir)
+}
+
+func TestFindDoesNotEscapeThroughIntermediateSymlink(t *testing.T) {
+	root := projectRoot(t)
+	outside := t.TempDir()
+	nested := filepath.Join(outside, "nested")
+	require.NoError(t, os.Mkdir(nested, 0755))
+	require.NoError(t, os.Symlink(outside, filepath.Join(root, "escape")))
+
+	_, err := Find(filepath.Join(root, "escape", "nested"))
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
 func TestFindRejectsSymlinkedIdentityFile(t *testing.T) {
 	root := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(root, ".dproxy.toml"), []byte("schema = 1\n"), 0644))

@@ -24,45 +24,81 @@ type Project struct {
 }
 
 func Find(start string) (Project, error) {
-	workdir, err := filepath.Abs(start)
+	startPath, err := filepath.Abs(start)
 	if err != nil {
 		return Project{}, fmt.Errorf("resolve start directory: %w", err)
 	}
-	workdir = filepath.Clean(workdir)
-	for dir := workdir; ; dir = filepath.Dir(dir) {
-		rootFD, openErr := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-		if openErr != nil {
-			return Project{}, fmt.Errorf("open project candidate: %w", openErr)
-		}
-		configFD, configErr := unix.Openat(rootFD, configName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	currentFD, err := unix.Open(filepath.Clean(startPath), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return Project{}, fmt.Errorf("open start directory: %w", err)
+	}
+	defer func() { _ = unix.Close(currentFD) }()
+	workdir, err := descriptorPath(currentFD)
+	if err != nil {
+		return Project{}, err
+	}
+	for {
+		configFD, configErr := unix.Openat(currentFD, configName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		if configErr == nil {
 			var stat unix.Stat_t
 			statErr := unix.Fstat(configFD, &stat)
 			_ = unix.Close(configFD)
 			if statErr != nil {
-				_ = unix.Close(rootFD)
 				return Project{}, fmt.Errorf("inspect project configuration: %w", statErr)
 			}
 			if stat.Mode&unix.S_IFMT != unix.S_IFREG {
-				_ = unix.Close(rootFD)
 				return Project{}, errors.New("project configuration must be a regular file")
 			}
-			project, loadErr := loadProjectAt(dir, workdir, rootFD)
-			_ = unix.Close(rootFD)
-			return project, loadErr
+			root, pathErr := descriptorPath(currentFD)
+			if pathErr != nil {
+				return Project{}, pathErr
+			}
+			return loadProjectAt(root, workdir, currentFD)
 		}
-		_ = unix.Close(rootFD)
 		if configErr != unix.ENOENT {
 			if configErr == unix.ELOOP {
 				return Project{}, errors.New("project configuration must not be a symlink")
 			}
 			return Project{}, fmt.Errorf("inspect project configuration: %w", configErr)
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
+		parentFD, openErr := unix.Openat(currentFD, "..", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if openErr != nil {
+			return Project{}, fmt.Errorf("open parent directory: %w", openErr)
+		}
+		same, compareErr := sameDirectory(currentFD, parentFD)
+		if compareErr != nil {
+			_ = unix.Close(parentFD)
+			return Project{}, compareErr
+		}
+		if same {
+			_ = unix.Close(parentFD)
 			return Project{}, ErrNotFound
 		}
+		_ = unix.Close(currentFD)
+		currentFD = parentFD
 	}
+}
+
+func descriptorPath(fd int) (string, error) {
+	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+	if err != nil {
+		return "", fmt.Errorf("resolve directory descriptor: %w", err)
+	}
+	if !filepath.IsAbs(path) || strings.HasSuffix(path, " (deleted)") {
+		return "", errors.New("directory moved during project discovery")
+	}
+	return filepath.Clean(path), nil
+}
+
+func sameDirectory(leftFD, rightFD int) (bool, error) {
+	var left, right unix.Stat_t
+	if err := unix.Fstat(leftFD, &left); err != nil {
+		return false, fmt.Errorf("inspect current directory: %w", err)
+	}
+	if err := unix.Fstat(rightFD, &right); err != nil {
+		return false, fmt.Errorf("inspect parent directory: %w", err)
+	}
+	return left.Dev == right.Dev && left.Ino == right.Ino, nil
 }
 
 func loadProject(root, workdir string) (Project, error) {
