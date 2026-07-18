@@ -4,6 +4,8 @@ import (
 	"errors"
 	"io"
 	"path"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"dproxy/internal/fault"
@@ -24,8 +26,8 @@ type Manifest struct {
 }
 
 type Image struct {
-	Repository string `toml:"repository"`
-	Tag        string `toml:"tag"`
+	Repository  string `toml:"repository"`
+	TagTemplate string `toml:"tag_template"`
 }
 
 type Cache struct {
@@ -87,7 +89,7 @@ func validateManifest(m Manifest) error {
 		}
 	}
 	for _, image := range m.Images {
-		if image.Repository == "" || image.Tag == "" {
+		if !validImageRepository(image.Repository) || strings.Count(image.TagTemplate, "{version}") != 1 || !tagTemplatePattern.MatchString(image.TagTemplate) {
 			return fail("invalid image mapping")
 		}
 	}
@@ -110,4 +112,22 @@ func validateManifest(m Manifest) error {
 		}
 	}
 	return nil
+}
+
+var (
+	imageRepositoryPattern = regexp.MustCompile(`^[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[1-9][0-9]{0,4})?/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$`)
+	tagTemplatePattern     = regexp.MustCompile(`^[A-Za-z0-9_.{}-]+$`)
+)
+
+func validImageRepository(repository string) bool {
+	if !imageRepositoryPattern.MatchString(repository) {
+		return false
+	}
+	registry := strings.SplitN(repository, "/", 2)[0]
+	if colon := strings.LastIndexByte(registry, ':'); colon >= 0 {
+		port := registry[colon+1:]
+		n, err := strconv.Atoi(port)
+		return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == port
+	}
+	return true
 }

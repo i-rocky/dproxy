@@ -4,7 +4,7 @@ bins = ["go", "gofmt"]
 commands = { go = ["go"], gofmt = ["gofmt"] }
 [images.default]
 repository = "docker.io/library/golang"
-tag = "{{version}}"
+tag_template = "{version}"
 [[caches]]
 path = "/go/pkg/mod"
 compatibility = "minor"

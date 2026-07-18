@@ -4,7 +4,7 @@ bins = ["node", "npm", "npx"]
 commands = { node = ["node"], npm = ["npm"], npx = ["npx"] }
 [images.default]
 repository = "docker.io/library/node"
-tag = "{{version}}"
+tag_template = "{version}"
 [[caches]]
 path = "/home/node/.npm"
 compatibility = "major"

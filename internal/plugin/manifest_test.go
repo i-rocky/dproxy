@@ -41,7 +41,7 @@ func TestManifestLoadsOfficialManifestsAndCommands(t *testing.T) {
 }
 
 func TestManifestValidation(t *testing.T) {
-	valid := "schema=1\nname=\"x\"\nbins=[\"x\"]\n[images.default]\nrepository=\"example/x\"\ntag=\"1\"\ncommands={x=[\"x\"]}\n"
+	valid := "schema=1\nname=\"x\"\nbins=[\"x\"]\n[images.default]\nrepository=\"registry.example/x\"\ntag_template=\"{version}\"\ncommands={x=[\"x\"]}\n"
 	cases := []string{
 		strings.Replace(valid, `schema=1`, `schema=2`, 1),
 		strings.Replace(valid, `name="x"`, `name="../x"`, 1),
@@ -50,7 +50,11 @@ func TestManifestValidation(t *testing.T) {
 		strings.Replace(valid, `bins=["x"]`, `bins=[]`, 1),
 		strings.Replace(valid, `commands={x=["x"]}`, `commands={x=["other"]}`, 1),
 		strings.Replace(valid, `commands={x=["x"]}`, `commands={x=["x"],y=["y"]}`, 1),
-		strings.Replace(valid, `repository="example/x"`, `repository=""`, 1),
+		strings.Replace(valid, `repository="registry.example/x"`, `repository=""`, 1),
+		strings.Replace(valid, `repository="registry.example/x"`, `repository="HTTPS://registry.example/x:tag"`, 1),
+		strings.Replace(valid, `repository="registry.example/x"`, `repository="registry.example:70000/x"`, 1),
+		strings.Replace(valid, `tag_template="{version}"`, `tag_template="latest"`, 1),
+		strings.Replace(valid, `tag_template="{version}"`, `tag_template="{version}-{version}"`, 1),
 		valid + "[[caches]]\npath=\"relative\"\n",
 		valid + "[[caches]]\npath=\"/tmp/../cache\"\n",
 		valid + "[environment]\n\"BAD=KEY\"=\"x\"\n",
