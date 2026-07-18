@@ -278,6 +278,29 @@ func TestGenerationParentSyncFailureLeavesIndexedRepositoryUnchanged(t *testing.
 	require.Equal(t, strings.Repeat("4", 40), updated.Commit)
 }
 
+func TestRepositoryRootSyncFailurePreventsIndexPublicationAndAllowsRetry(t *testing.T) {
+	git := &fakeGit{t: t, manifest: validManifest("tool", "tool"), tree: "100644 blob abc\ttool.toml\x00", commit: strings.Repeat("7", 40)}
+	s, err := NewStore(t.TempDir(), git)
+	require.NoError(t, err)
+	indexPublications := 0
+	realRename := s.renameIndex
+	s.renameIndex = func(old, new string) error {
+		indexPublications++
+		return realRename(old, new)
+	}
+	realSync := s.syncReposRoot
+	s.syncReposRoot = func() error { return fmt.Errorf("injected repositories root sync failure") }
+	_, err = s.Add(context.Background(), "https://example.test/plugins.git", TrustDecision{Explicit: true})
+	require.Error(t, err)
+	require.Zero(t, indexPublications)
+	require.Empty(t, s.index.Repositories)
+	require.NoFileExists(t, filepath.Join(s.root, "index.toml"))
+	s.syncReposRoot = realSync
+	_, err = s.Add(context.Background(), "https://example.test/plugins.git", TrustDecision{Explicit: true})
+	require.NoError(t, err)
+	require.Equal(t, 1, indexPublications)
+}
+
 func TestStoreRejectsDuplicateManifestNamesAcrossRepositories(t *testing.T) {
 	git := &fakeGit{t: t, manifest: validManifest("same", "one"), tree: "100644 blob abc\ttool.toml\x00", commit: strings.Repeat("5", 40)}
 	s, err := NewStore(t.TempDir(), git)

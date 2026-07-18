@@ -48,6 +48,7 @@ type Store struct {
 	index                storeIndex
 	renameIndex          func(string, string) error
 	syncRoot             func() error
+	syncReposRoot        func() error
 	syncGenerationParent func(string) error
 }
 
@@ -57,6 +58,12 @@ func NewStore(root string, git Git) (*Store, error) {
 	}
 	if err := os.MkdirAll(filepath.Join(root, "repos"), 0o700); err != nil {
 		return nil, fault.New("open plugin store", "create failed", err)
+	}
+	if err := syncDirectory(root); err != nil {
+		return nil, fault.New("open plugin store", "root sync failed", err)
+	}
+	if err := syncDirectory(filepath.Join(root, "repos")); err != nil {
+		return nil, fault.New("open plugin store", "repositories sync failed", err)
 	}
 	if err := os.Chmod(root, 0o700); err != nil {
 		return nil, fault.New("open plugin store", "permissions failed", err)
@@ -68,6 +75,7 @@ func NewStore(root string, git Git) (*Store, error) {
 	s := &Store{root: root, git: git, index: storeIndex{Schema: 1}}
 	s.renameIndex = os.Rename
 	s.syncRoot = func() error { return syncDirectory(root) }
+	s.syncReposRoot = func() error { return syncDirectory(filepath.Join(root, "repos")) }
 	s.syncGenerationParent = syncDirectory
 	if _, ok := git.(execGit); ok {
 		s.git = execGit{executable: "/usr/bin/git", home: home}
@@ -264,6 +272,9 @@ func (s *Store) publishGeneration(stage string, repository Repository) error {
 	parent := filepath.Join(s.root, "repos", repository.Name)
 	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return fault.New("publish plugin generation", "parent creation failed", err)
+	}
+	if err := s.syncReposRoot(); err != nil {
+		return fault.New("publish plugin generation", "repositories root sync failed", err)
 	}
 	final := generationDirectory(s.root, repository)
 	if _, err := os.Lstat(final); err == nil {
