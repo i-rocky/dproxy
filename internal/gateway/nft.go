@@ -15,6 +15,7 @@ import (
 )
 
 const nftTableName = "dproxy"
+const MaxPinnedEndpoints uint32 = 4096
 
 type nftConn interface {
 	AddTable(*nftables.Table) *nftables.Table
@@ -30,7 +31,6 @@ type NFT struct {
 	DNSPort            uint16
 	table              *nftables.Table
 	allowed4, allowed6 *nftables.Set
-	allowedPorts       *nftables.Set
 }
 
 func (n *NFT) Install() error {
@@ -49,20 +49,12 @@ func (n *NFT) Install() error {
 	drop := nftables.ChainPolicyDrop
 	out := n.Conn.AddChain(&nftables.Chain{Name: "output", Table: t, Type: nftables.ChainTypeFilter, Hooknum: nftables.ChainHookOutput, Priority: nftables.ChainPriorityFilter, Policy: &drop})
 	nat := n.Conn.AddChain(&nftables.Chain{Name: "dns_redirect", Table: t, Type: nftables.ChainTypeNAT, Hooknum: nftables.ChainHookOutput, Priority: nftables.ChainPriorityNATDest})
-	n.allowed4 = &nftables.Set{Table: t, Name: "allowed4", KeyType: nftables.TypeIPAddr, HasTimeout: true, Timeout: 5 * time.Minute}
-	n.allowed6 = &nftables.Set{Table: t, Name: "allowed6", KeyType: nftables.TypeIP6Addr, HasTimeout: true, Timeout: 5 * time.Minute}
-	n.allowedPorts = &nftables.Set{Table: t, Name: "allowed_ports", KeyType: nftables.TypeInetService, Constant: true}
+	n.allowed4 = &nftables.Set{Table: t, Name: "allowed4_endpoints", KeyType: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeInetService), Concatenation: true, HasTimeout: true, Timeout: 5 * time.Minute, Size: MaxPinnedEndpoints}
+	n.allowed6 = &nftables.Set{Table: t, Name: "allowed6_endpoints", KeyType: nftables.MustConcatSetType(nftables.TypeIP6Addr, nftables.TypeInetService), Concatenation: true, HasTimeout: true, Timeout: 5 * time.Minute, Size: MaxPinnedEndpoints}
 	if err = n.Conn.AddSet(n.allowed4, nil); err != nil {
 		return err
 	}
 	if err = n.Conn.AddSet(n.allowed6, nil); err != nil {
-		return err
-	}
-	var portElements []nftables.SetElement
-	for _, p := range n.Policy.Ports {
-		portElements = append(portElements, nftables.SetElement{Key: binaryutil.BigEndian.PutUint16(p)})
-	}
-	if err = n.Conn.AddSet(n.allowedPorts, portElements); err != nil {
 		return err
 	}
 	// Marked gateway control traffic is the only bypass.
@@ -94,8 +86,8 @@ func (n *NFT) Install() error {
 				n.Conn.AddRule(&nftables.Rule{Table: t, Chain: out, Exprs: []expr.Any{&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}}, &expr.Verdict{Kind: expr.VerdictAccept}}})
 			}
 		case RulePinned:
-			addLookupRule(n.Conn, t, out, n.allowed4, n.allowedPorts, 4)
-			addLookupRule(n.Conn, t, out, n.allowed6, n.allowedPorts, 6)
+			addLookupRule(n.Conn, t, out, n.allowed4, 4)
+			addLookupRule(n.Conn, t, out, n.allowed6, 6)
 		}
 	}
 	return n.Conn.Flush()
@@ -118,7 +110,7 @@ func addPrefixRule(c nftConn, t *nftables.Table, ch *nftables.Chain, s RuleSpec,
 	}
 	c.AddRule(&nftables.Rule{Table: t, Chain: ch, Exprs: []expr.Any{&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{family}}, &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: uint32(len(raw))}, &expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: uint32(len(raw)), Mask: mask, Xor: make([]byte, len(raw))}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: andBytes(raw, mask)}, &expr.Verdict{Kind: verdict}}})
 }
-func addLookupRule(c nftConn, t *nftables.Table, ch *nftables.Chain, set, ports *nftables.Set, v int) {
+func addLookupRule(c nftConn, t *nftables.Table, ch *nftables.Chain, set *nftables.Set, v int) {
 	offset := uint32(24)
 	l := uint32(16)
 	family := byte(unix.NFPROTO_IPV6)
@@ -127,18 +119,31 @@ func addLookupRule(c nftConn, t *nftables.Table, ch *nftables.Chain, set, ports 
 		l = 4
 		family = unix.NFPROTO_IPV4
 	}
+	portRegister := uint32(5)
+	if v == 4 {
+		portRegister = 2
+	}
 	for _, proto := range []byte{unix.IPPROTO_TCP, unix.IPPROTO_UDP} {
-		c.AddRule(&nftables.Rule{Table: t, Chain: ch, Exprs: []expr.Any{&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{family}}, &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: l}, &expr.Lookup{SourceRegister: 1, SetName: set.Name, SetID: set.ID}, &expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}}, &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2}, &expr.Lookup{SourceRegister: 1, SetName: ports.Name, SetID: ports.ID}, &expr.Verdict{Kind: expr.VerdictAccept}}})
+		c.AddRule(&nftables.Rule{Table: t, Chain: ch, Exprs: []expr.Any{&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{family}}, &expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}}, &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: l}, &expr.Payload{DestRegister: portRegister, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2}, &expr.Lookup{SourceRegister: 1, SetName: set.Name, SetID: set.ID}, &expr.Verdict{Kind: expr.VerdictAccept}}})
 	}
 }
-func (n *NFT) Pin(_ context.Context, addrs []netip.Addr, ttl time.Duration) error {
+func (n *NFT) Pin(_ context.Context, pins []PinnedEndpoint, ttl time.Duration) error {
 	if n.Conn == nil || n.allowed4 == nil {
 		return errors.New("nft pin sets unavailable")
 	}
+	if ttl <= 0 || ttl > 5*time.Minute {
+		return errors.New("invalid pin expiry")
+	}
 	var v4, v6 []nftables.SetElement
-	for _, a := range addrs {
-		a = a.Unmap()
-		e := nftables.SetElement{Key: a.AsSlice(), Timeout: ttl}
+	for _, pin := range pins {
+		if pin.Port == 0 || !pin.Addr.IsValid() || !n.Policy.AllowsIP(pin.Addr) {
+			return errors.New("invalid pinned endpoint")
+		}
+		a := pin.Addr.Unmap()
+		key := append([]byte(nil), a.AsSlice()...)
+		key = append(key, binaryutil.BigEndian.PutUint16(pin.Port)...)
+		key = append(key, 0, 0)
+		e := nftables.SetElement{Key: key, Timeout: ttl}
 		if a.Is4() {
 			v4 = append(v4, e)
 		} else {

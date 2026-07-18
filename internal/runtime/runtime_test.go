@@ -13,18 +13,21 @@ import (
 	"time"
 
 	"dproxy/internal/engine"
+	networkpolicy "dproxy/internal/network"
 	"dproxy/internal/policy"
 
 	"github.com/stretchr/testify/require"
 )
 
 type fakeEngine struct {
-	mu        sync.Mutex
-	calls     []string
-	exit      int
-	waitErr   error
-	removeErr error
-	waitDelay time.Duration
+	mu            sync.Mutex
+	calls         []string
+	exit          int
+	waitErr       error
+	removeErr     error
+	waitDelay     time.Duration
+	commandPlan   policy.Plan
+	commandTarget string
 }
 
 func (f *fakeEngine) call(s string)                              { f.mu.Lock(); defer f.mu.Unlock(); f.calls = append(f.calls, s) }
@@ -42,8 +45,10 @@ func (f *fakeEngine) GatewayHealth(context.Context, engine.Resource, string) err
 	f.call("gateway-health")
 	return nil
 }
-func (f *fakeEngine) StartCommand(context.Context, policy.Plan, string, bool) (engine.Resource, error) {
+func (f *fakeEngine) StartCommand(_ context.Context, p policy.Plan, target string, _ bool) (engine.Resource, error) {
 	f.call("create-command")
+	f.commandPlan = p
+	f.commandTarget = target
 	return engine.Resource{ID: "command", Role: engine.CommandRole}, nil
 }
 func (f *fakeEngine) Attach(context.Context, string, engine.IO) (engine.Attachment, error) {
@@ -87,6 +92,29 @@ type fakeAttachment struct{}
 func (fakeAttachment) Wait() error  { return nil }
 func (fakeAttachment) Close() error { return nil }
 
+type fakeNetworkSession struct {
+	id, gateway string
+	calls       *[]string
+}
+
+func (s *fakeNetworkSession) InvocationID() string { return s.id }
+func (s *fakeNetworkSession) GatewayID() string    { return s.gateway }
+func (s *fakeNetworkSession) Close(context.Context) error {
+	*s.calls = append(*s.calls, "close-network-session")
+	return nil
+}
+
+type fakeNetworkManager struct{ calls *[]string }
+
+func (m fakeNetworkManager) Begin(_ context.Context, r networkpolicy.Request) (networkpolicy.RuntimeSession, error) {
+	*m.calls = append(*m.calls, "orchestrator-start-"+r.Plan.Network.Mode)
+	gateway := ""
+	if r.Plan.Network.Mode != "none" {
+		gateway = "gateway"
+	}
+	return &fakeNetworkSession{id: "crypto-invocation", gateway: gateway, calls: m.calls}, nil
+}
+
 func runtimePlan(mode string) policy.Plan {
 	p := policy.Plan{InvocationID: "inv", ProjectID: "project", Image: "repo@sha256:x", Network: policy.Network{Mode: mode}}
 	return p
@@ -95,17 +123,21 @@ func testIO() IO { return IO{Stdin: bytes.NewReader(nil), Stdout: io.Discard, St
 
 func TestRunReturnsExitAndCleansUp(t *testing.T) {
 	f := &fakeEngine{exit: 42}
-	code, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, CleanupTimeout: time.Second}, runtimePlan("public"), testIO())
+	code, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Network: fakeNetworkManager{&f.calls}, CleanupTimeout: time.Second}, runtimePlan("public"), testIO())
 	require.NoError(t, err)
 	require.Equal(t, 42, code)
-	require.Equal(t, []string{"verify", "pull", "create-network", "start-gateway", "gateway-health", "create-command", "attach-start", "wait", "remove-command", "remove-gateway", "remove-network"}, f.calls)
+	require.Equal(t, []string{"verify", "pull", "orchestrator-start-public", "create-command", "attach-start", "wait", "remove-command", "close-network-session"}, f.calls)
+	require.NotContains(t, f.calls, "create-network")
+	require.NotContains(t, f.calls, "start-gateway")
+	require.Equal(t, "crypto-invocation", f.commandPlan.InvocationID)
+	require.Equal(t, "gateway", f.commandTarget)
 }
 
 func TestRunCleansWithBoundedFreshContextAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &fakeEngine{exit: 130}
 	cancel()
-	code, err := Run(ctx, Dependencies{Engine: recordingEngine{f}, CleanupTimeout: 20 * time.Millisecond}, runtimePlan("none"), testIO())
+	code, err := Run(ctx, Dependencies{Engine: recordingEngine{f}, Network: fakeNetworkManager{&f.calls}, CleanupTimeout: 20 * time.Millisecond}, runtimePlan("none"), testIO())
 	require.Equal(t, 130, code)
 	require.NoError(t, err)
 	require.Contains(t, f.calls, "remove-command")
@@ -113,7 +145,7 @@ func TestRunCleansWithBoundedFreshContextAfterCancellation(t *testing.T) {
 
 func TestRunReturnsSetupErrorSeparatelyFromCommandExit(t *testing.T) {
 	f := &fakeEngine{exit: 7, waitErr: errors.New("wait transport failed")}
-	code, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}}, runtimePlan("none"), testIO())
+	code, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Network: fakeNetworkManager{&f.calls}}, runtimePlan("none"), testIO())
 	require.Equal(t, 7, code)
 	require.ErrorContains(t, err, "wait")
 }
@@ -123,14 +155,14 @@ func TestRunRelaysSignals(t *testing.T) {
 	signals <- syscall.SIGINT
 	close(signals)
 	f := &fakeEngine{waitDelay: 10 * time.Millisecond}
-	_, _ = Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Signals: signals}, runtimePlan("none"), testIO())
+	_, _ = Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Network: fakeNetworkManager{&f.calls}, Signals: signals}, runtimePlan("none"), testIO())
 	require.Contains(t, f.calls, "signal")
 }
 
 func TestRunRestoresTTYAndReportsCleanupFailure(t *testing.T) {
 	restored := false
 	f := &fakeEngine{removeErr: errors.New("remove failed")}
-	code, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}}, runtimePlan("none"), IO{Stdin: bytes.NewReader(nil), Stdout: io.Discard, Stderr: io.Discard, TTY: true, MakeRaw: func() (func() error, error) { return func() error { restored = true; return nil }, nil }, TerminalSize: func() (uint, uint, error) { return 24, 80, nil }})
+	code, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Network: fakeNetworkManager{&f.calls}}, runtimePlan("none"), IO{Stdin: bytes.NewReader(nil), Stdout: io.Discard, Stderr: io.Discard, TTY: true, MakeRaw: func() (func() error, error) { return func() error { restored = true; return nil }, nil }, TerminalSize: func() (uint, uint, error) { return 24, 80, nil }})
 	require.Zero(t, code)
 	require.ErrorContains(t, err, "cleanup")
 	require.True(t, restored)
@@ -138,7 +170,7 @@ func TestRunRestoresTTYAndReportsCleanupFailure(t *testing.T) {
 
 func TestRunRejectsTTYWithoutRawModeAndStillCleans(t *testing.T) {
 	f := &fakeEngine{}
-	_, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}}, runtimePlan("none"), IO{TTY: true})
+	_, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Network: fakeNetworkManager{&f.calls}}, runtimePlan("none"), IO{TTY: true})
 	require.ErrorContains(t, err, "raw-mode")
 	require.Contains(t, f.calls, "remove-command")
 }
@@ -147,7 +179,7 @@ func TestRunDoesNotRequireCallerToCloseSignalChannel(t *testing.T) {
 	f := &fakeEngine{}
 	done := make(chan error, 1)
 	go func() {
-		_, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Signals: make(chan os.Signal)}, runtimePlan("none"), testIO())
+		_, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Network: fakeNetworkManager{&f.calls}, Signals: make(chan os.Signal)}, runtimePlan("none"), testIO())
 		done <- err
 	}()
 	select {
@@ -165,7 +197,7 @@ func TestRunResizesTTYInitiallyAndOnWINCHWithoutSendingSignal(t *testing.T) {
 	sizes := [][2]uint{{24, 80}, {40, 120}}
 	var i int
 	f := &fakeEngine{waitDelay: 10 * time.Millisecond}
-	_, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Signals: signals}, runtimePlan("none"), IO{TTY: true, MakeRaw: func() (func() error, error) { return func() error { return nil }, nil }, TerminalSize: func() (uint, uint, error) { size := sizes[i]; i++; return size[0], size[1], nil }})
+	_, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Network: fakeNetworkManager{&f.calls}, Signals: signals}, runtimePlan("none"), IO{TTY: true, MakeRaw: func() (func() error, error) { return func() error { return nil }, nil }, TerminalSize: func() (uint, uint, error) { size := sizes[i]; i++; return size[0], size[1], nil }})
 	require.NoError(t, err)
 	require.Contains(t, f.calls, "resize-24x80")
 	require.Contains(t, f.calls, "resize-40x120")

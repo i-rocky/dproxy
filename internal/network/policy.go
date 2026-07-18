@@ -14,10 +14,13 @@ import (
 // Policy is intentionally data-only so the exact policy can be JSON encoded for
 // the gateway. DeniedPrefixes includes the host's active Docker networks.
 type Policy struct {
-	Mode           string   `json:"mode"`
-	Domains        []string `json:"domains,omitempty"`
-	Ports          []uint16 `json:"ports,omitempty"`
-	DeniedPrefixes []string `json:"denied_prefixes"`
+	Mode           string            `json:"mode"`
+	Endpoints      []AllowedEndpoint `json:"endpoints,omitempty"`
+	DeniedPrefixes []string          `json:"denied_prefixes"`
+}
+type AllowedEndpoint struct {
+	Domain string   `json:"domain"`
+	Ports  []uint16 `json:"ports"`
 }
 
 // The deny list is based on the IANA IPv4 and IPv6 special-purpose registries.
@@ -29,7 +32,7 @@ var specialPrefixes = []string{
 	"192.31.196.0/24", "192.52.193.0/24", "192.88.99.0/24", "192.168.0.0/16",
 	"192.175.48.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
 	"224.0.0.0/4", "240.0.0.0/4",
-	"::/128", "::1/128", "::ffff:0:0/96", "64:ff9b:1::/48", "100::/64",
+	"::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
 	"2001::/23", "2001:db8::/32", "2002::/16", "3fff::/20", "5f00::/16",
 	"fc00::/7", "fe80::/10", "ff00::/8",
 }
@@ -49,7 +52,7 @@ func Public(dockerSubnets ...netip.Prefix) Policy {
 func Allowlist(entries []string, dockerSubnets ...netip.Prefix) (Policy, error) {
 	p := Public(dockerSubnets...)
 	p.Mode = "allowlist"
-	seenDomains, seenPorts := map[string]bool{}, map[uint16]bool{}
+	index := map[string]int{}
 	for _, entry := range entries {
 		host, rawPort, err := net.SplitHostPort(entry)
 		if err != nil || host == "" {
@@ -63,16 +66,23 @@ func Allowlist(entries []string, dockerSubnets ...netip.Prefix) (Policy, error) 
 		if err != nil || port == 0 {
 			return Policy{}, errors.New("invalid allowlist port")
 		}
-		if !seenDomains[host] {
-			p.Domains = append(p.Domains, host)
-			seenDomains[host] = true
+		i, ok := index[host]
+		if !ok {
+			i = len(p.Endpoints)
+			index[host] = i
+			p.Endpoints = append(p.Endpoints, AllowedEndpoint{Domain: host})
 		}
-		if !seenPorts[uint16(port)] {
-			p.Ports = append(p.Ports, uint16(port))
-			seenPorts[uint16(port)] = true
+		found := false
+		for _, existing := range p.Endpoints[i].Ports {
+			if existing == uint16(port) {
+				found = true
+			}
+		}
+		if !found {
+			p.Endpoints[i].Ports = append(p.Endpoints[i].Ports, uint16(port))
 		}
 	}
-	if len(p.Domains) == 0 {
+	if len(p.Endpoints) == 0 {
 		return Policy{}, errors.New("allowlist is empty")
 	}
 	return p, nil
@@ -106,8 +116,8 @@ func (p Policy) AllowsDomain(raw string) bool {
 	if p.Mode != "allowlist" {
 		return false
 	}
-	for _, allowed := range p.Domains {
-		if host == allowed {
+	for _, allowed := range p.Endpoints {
+		if host == allowed.Domain {
 			return true
 		}
 	}
@@ -124,7 +134,32 @@ func (p Policy) AllowsPort(port int) bool {
 	if p.Mode != "allowlist" {
 		return false
 	}
-	for _, allowed := range p.Ports {
+	for _, endpoint := range p.Endpoints {
+		for _, allowed := range endpoint.Ports {
+			if int(allowed) == port {
+				return true
+			}
+		}
+	}
+	return false
+}
+func (p Policy) PortsForDomain(raw string) []uint16 {
+	host, err := canonicalDomain(raw)
+	if err != nil {
+		return nil
+	}
+	for _, e := range p.Endpoints {
+		if e.Domain == host {
+			return append([]uint16(nil), e.Ports...)
+		}
+	}
+	return nil
+}
+func (p Policy) AllowsEndpoint(domain string, port int) bool {
+	if p.Mode == "public" {
+		return p.AllowsDomain(domain) && p.AllowsPort(port)
+	}
+	for _, allowed := range p.PortsForDomain(domain) {
 		if int(allowed) == port {
 			return true
 		}

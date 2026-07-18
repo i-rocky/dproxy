@@ -8,7 +8,7 @@ import (
 )
 
 func TestPublicBlocksProtectedAddresses(t *testing.T) {
-	blocked := []string{"0.0.0.0", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.169.254", "172.17.0.1", "192.168.1.1", "192.0.2.1", "224.0.0.1", "240.0.0.1", "::", "::1", "fc00::1", "fe80::1", "ff00::1", "2001:db8::1", "::ffff:127.0.0.1"}
+	blocked := []string{"0.0.0.0", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.169.254", "172.17.0.1", "192.168.1.1", "192.0.2.1", "224.0.0.1", "240.0.0.1", "::", "::1", "fc00::1", "fe80::1", "ff00::1", "2001:db8::1", "::ffff:127.0.0.1", "64:ff9b::7f00:1", "64:ff9b:1::7f00:1"}
 	for _, raw := range blocked {
 		require.False(t, Public().AllowsIP(netip.MustParseAddr(raw)), raw)
 	}
@@ -28,6 +28,15 @@ func TestAllowlistCanonicalizesIDNAAndRequiresDeclaredPort(t *testing.T) {
 	require.True(t, p.AllowsDomain("bücher.EXAMPLE."))
 	require.True(t, p.AllowsPort(443))
 	require.False(t, p.AllowsPort(80))
+}
+func TestAllowlistPreservesDomainPortAssociation(t *testing.T) {
+	p, err := Allowlist([]string{"a.example:443", "b.example:80"})
+	require.NoError(t, err)
+	require.True(t, p.AllowsEndpoint("a.example", 443))
+	require.True(t, p.AllowsEndpoint("b.example", 80))
+	require.False(t, p.AllowsEndpoint("a.example", 80))
+	require.False(t, p.AllowsEndpoint("b.example", 443))
+	require.Equal(t, []uint16{443}, p.PortsForDomain("a.example"))
 }
 
 func TestAllowlistRejectsNumericAndAmbiguousHosts(t *testing.T) {

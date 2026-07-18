@@ -19,8 +19,8 @@ func (f fakeExchange) ExchangeContext(context.Context, *dns.Msg, string) (*dns.M
 }
 
 type fakePinner struct {
-	addrs []netip.Addr
-	ttl   time.Duration
+	pins []PinnedEndpoint
+	ttl  time.Duration
 }
 type captureDNSWriter struct{ msg *dns.Msg }
 
@@ -45,8 +45,8 @@ func TestDNSHandlerHealthAndDeniedResponses(t *testing.T) {
 	require.Equal(t, dns.RcodeRefused, w.msg.Rcode)
 }
 
-func (f *fakePinner) Pin(_ context.Context, a []netip.Addr, d time.Duration) error {
-	f.addrs = append([]netip.Addr(nil), a...)
+func (f *fakePinner) Pin(_ context.Context, a []PinnedEndpoint, d time.Duration) error {
+	f.pins = append([]PinnedEndpoint(nil), a...)
 	f.ttl = d
 	return nil
 }
@@ -81,7 +81,7 @@ func TestDNSRejectsMixedProtectedAnswersWithoutPinning(t *testing.T) {
 	q.SetQuestion("example.com.", dns.TypeA)
 	_, err = proxy.resolve(context.Background(), q)
 	require.Error(t, err)
-	require.Empty(t, pin.addrs)
+	require.Empty(t, pin.pins)
 }
 func TestDNSPinsAuthorizedAnswersWithBoundedTTL(t *testing.T) {
 	p, err := networkpolicy.Allowlist([]string{"example.com:443"})
@@ -95,5 +95,18 @@ func TestDNSPinsAuthorizedAnswersWithBoundedTTL(t *testing.T) {
 	_, err = proxy.resolve(context.Background(), q)
 	require.NoError(t, err)
 	require.Equal(t, 2*time.Minute, pin.ttl)
-	require.Equal(t, []netip.Addr{netip.MustParseAddr("93.184.216.34")}, pin.addrs)
+	require.Equal(t, []PinnedEndpoint{{Addr: netip.MustParseAddr("93.184.216.34"), Port: 443}}, pin.pins)
+}
+func TestDNSPinsOnlyAssociatedPortsForSharedIP(t *testing.T) {
+	p, err := networkpolicy.Allowlist([]string{"a.example:443", "b.example:80"})
+	require.NoError(t, err)
+	pin := &fakePinner{}
+	m := new(dns.Msg)
+	m.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "a.example.", Rrtype: dns.TypeA, Ttl: 30}, A: netip.MustParseAddr("93.184.216.34").AsSlice()}}
+	proxy := &DNSProxy{Policy: p, Upstream: "dns:53", Exchange: fakeExchange{m}, Pinner: pin}
+	q := new(dns.Msg)
+	q.SetQuestion("a.example.", dns.TypeA)
+	_, err = proxy.resolve(context.Background(), q)
+	require.NoError(t, err)
+	require.Equal(t, []PinnedEndpoint{{Addr: netip.MustParseAddr("93.184.216.34"), Port: 443}}, pin.pins)
 }

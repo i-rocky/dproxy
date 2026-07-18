@@ -34,8 +34,16 @@ type Request struct {
 }
 
 type Orchestrator struct{ engine GatewayEngine }
+type RuntimeSession interface {
+	InvocationID() string
+	GatewayID() string
+	Close(context.Context) error
+}
 
 func NewOrchestrator(e GatewayEngine) *Orchestrator { return &Orchestrator{engine: e} }
+func (o *Orchestrator) Begin(ctx context.Context, r Request) (RuntimeSession, error) {
+	return o.Start(ctx, r)
+}
 
 type Session struct {
 	engine     GatewayEngine

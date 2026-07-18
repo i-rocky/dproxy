@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"syscall"
 	"time"
 
 	networkpolicy "dproxy/internal/network"
@@ -75,8 +76,18 @@ func LoadPolicy(path string) (networkpolicy.Policy, error) {
 	if p.Mode != "public" && p.Mode != "allowlist" {
 		return networkpolicy.Policy{}, errors.New("invalid policy mode")
 	}
-	if p.Mode == "allowlist" && (len(p.Domains) == 0 || len(p.Ports) == 0) {
+	if p.Mode == "allowlist" && len(p.Endpoints) == 0 {
 		return networkpolicy.Policy{}, errors.New("incomplete allowlist policy")
+	}
+	for _, endpoint := range p.Endpoints {
+		if !p.AllowsDomain(endpoint.Domain) || len(endpoint.Ports) == 0 {
+			return networkpolicy.Policy{}, errors.New("invalid allowlist endpoint")
+		}
+		for _, port := range endpoint.Ports {
+			if port == 0 {
+				return networkpolicy.Policy{}, errors.New("invalid allowlist endpoint port")
+			}
+		}
 	}
 	if len(p.DeniedPrefixes) == 0 {
 		return networkpolicy.Policy{}, errors.New("policy has no protected ranges")
@@ -110,6 +121,9 @@ func Serve(ctx context.Context, policyPath, readyPath string, installer ControlI
 	return ServeWithToken(ctx, policyPath, readyPath, "", installer)
 }
 func ServeWithToken(ctx context.Context, policyPath, readyPath, token string, installer ControlInstaller) error {
+	if token == "" {
+		return errors.New("nonempty gateway health token is required")
+	}
 	if _, err := LoadPolicy(policyPath); err != nil {
 		return err
 	}
@@ -137,13 +151,20 @@ func Health(readyPath, expectedToken, probeToken string) error {
 	if expectedToken == "" || probeToken == "" || len(expectedToken) != len(probeToken) || subtle.ConstantTimeCompare([]byte(expectedToken), []byte(probeToken)) != 1 {
 		return errors.New("gateway health authentication failed")
 	}
+	info, err := os.Lstat(readyPath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0400 {
+		return errors.New("gateway readiness state has unsafe mode")
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || int(stat.Uid) != os.Geteuid() {
+		return errors.New("gateway readiness state has unsafe ownership")
+	}
 	b, err := os.ReadFile(readyPath)
 	var state readiness
 	if err != nil || json.Unmarshal(b, &state) != nil || state.Controls != readyState {
 		return errors.New("gateway controls are not ready")
 	}
 	h := sha256.Sum256([]byte(expectedToken))
-	if state.TokenHash != hex.EncodeToString(h[:]) && state.TokenHash != hex.EncodeToString(sha256.New().Sum(nil)) {
+	if state.TokenHash != hex.EncodeToString(h[:]) {
 		return errors.New("gateway policy/token state mismatch")
 	}
 	return nil
@@ -161,6 +182,10 @@ func SystemHealth(readyPath, policyPath, expectedToken, probeToken, dnsAddress s
 	if json.Unmarshal(stateBytes, &state) != nil {
 		return errors.New("invalid readiness state")
 	}
+	p, err := LoadPolicy(policyPath)
+	if err != nil {
+		return err
+	}
 	policyBytes, err := os.ReadFile(policyPath)
 	if err != nil {
 		return err
@@ -169,16 +194,16 @@ func SystemHealth(readyPath, policyPath, expectedToken, probeToken, dnsAddress s
 	if state.PolicyHash != hex.EncodeToString(sum[:]) {
 		return errors.New("gateway policy hash mismatch")
 	}
-	return VerifySystemHealth(realHealthInspector{}, dnsAddress)
+	return VerifySystemHealth(realHealthInspector{}, dnsAddress, p)
 }
 
 type HealthInspector interface {
 	Forwarding(string) error
 	DNS(string, string) error
-	NFT() error
+	NFT(networkpolicy.Policy) error
 }
 
-func VerifySystemHealth(i HealthInspector, dnsAddress string) error {
+func VerifySystemHealth(i HealthInspector, dnsAddress string, p ...networkpolicy.Policy) error {
 	if i == nil {
 		return errors.New("health inspector required")
 	}
@@ -194,7 +219,11 @@ func VerifySystemHealth(i HealthInspector, dnsAddress string) error {
 	if err := i.DNS("udp", dnsAddress); err != nil {
 		return err
 	}
-	return i.NFT()
+	var policy networkpolicy.Policy
+	if len(p) > 0 {
+		policy = p[0]
+	}
+	return i.NFT(policy)
 }
 
 type realHealthInspector struct{}
@@ -223,45 +252,6 @@ func (realHealthInspector) DNS(network, dnsAddress string) error {
 	}
 	return nil
 }
-func (realHealthInspector) NFT() error {
-	conn := &nftables.Conn{}
-	tables, err := conn.ListTables()
-	if err != nil {
-		return fmt.Errorf("inspect nftables: %w", err)
-	}
-	var table *nftables.Table
-	for _, t := range tables {
-		if t.Name == nftTableName && t.Family == nftables.TableFamilyINet {
-			table = t
-			break
-		}
-	}
-	if table == nil {
-		return errors.New("gateway nft table is missing")
-	}
-	chains, err := conn.ListChains()
-	if err != nil {
-		return err
-	}
-	chainNames := map[string]bool{}
-	for _, c := range chains {
-		if c.Table != nil && c.Table.Name == nftTableName {
-			chainNames[c.Name] = true
-		}
-	}
-	if !chainNames["output"] || !chainNames["dns_redirect"] {
-		return errors.New("gateway nft chains are missing")
-	}
-	sets, err := conn.GetSets(table)
-	if err != nil {
-		return err
-	}
-	setNames := map[string]bool{}
-	for _, s := range sets {
-		setNames[s.Name] = true
-	}
-	if !setNames["allowed4"] || !setNames["allowed6"] || !setNames["allowed_ports"] {
-		return errors.New("gateway nft sets are missing")
-	}
-	return nil
+func (realHealthInspector) NFT(p networkpolicy.Policy) error {
+	return VerifyNFTAttestation(p, 1053, &nftables.Conn{})
 }

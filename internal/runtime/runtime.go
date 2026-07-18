@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"dproxy/internal/engine"
+	networkpolicy "dproxy/internal/network"
 	"dproxy/internal/policy"
 )
 
@@ -18,9 +19,13 @@ const defaultCleanupTimeout = 10 * time.Second
 
 type Dependencies struct {
 	Engine         engine.Engine
-	Gateway        engine.GatewaySpec
+	Network        NetworkManager
+	NetworkRequest networkpolicy.Request
 	Signals        <-chan os.Signal
 	CleanupTimeout time.Duration
+}
+type NetworkManager interface {
+	Begin(context.Context, networkpolicy.Request) (networkpolicy.RuntimeSession, error)
 }
 type IO struct {
 	Stdin          io.Reader
@@ -34,16 +39,25 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 	if deps.Engine == nil {
 		return 0, errors.New("runtime engine is required")
 	}
+	if deps.Network == nil {
+		return 0, errors.New("network orchestrator is required")
+	}
 	timeout := deps.CleanupTimeout
 	if timeout <= 0 {
 		timeout = defaultCleanupTimeout
 	}
 	var resources []engine.Resource
+	var networkSession networkpolicy.RuntimeSession
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer cancel()
 		if err := cleanup(cleanupCtx, deps.Engine, resources); err != nil && setupErr == nil {
 			setupErr = err
+		}
+		if networkSession != nil {
+			if err := networkSession.Close(cleanupCtx); err != nil && setupErr == nil {
+				setupErr = fmt.Errorf("cleanup network session: %w", err)
+			}
 		}
 	}()
 	if err := deps.Engine.Verify(ctx); err != nil {
@@ -52,29 +66,14 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 	if err := deps.Engine.PullByDigest(ctx, plan.Image); err != nil {
 		return 0, fmt.Errorf("prepare locked image: %w", err)
 	}
-	var networkID string
-	var commandNetworkTarget string
-	if plan.Network.Mode != "none" {
-		network, err := deps.Engine.CreateNetwork(ctx, plan)
-		if err != nil {
-			return 0, fmt.Errorf("create isolated network: %w", err)
-		}
-		resources = append(resources, network)
-		networkID = network.ID
-		spec := deps.Gateway
-		spec.InternalNetworkID = networkID
-		spec.Ownership = engine.Ownership{ProjectID: plan.ProjectID, InvocationID: plan.InvocationID}
-		spec.Ports = append([]policy.Port(nil), plan.Ports...)
-		gateway, err := deps.Engine.StartGateway(ctx, spec)
-		if err != nil {
-			return 0, fmt.Errorf("start filtering gateway: %w", err)
-		}
-		resources = append(resources, gateway)
-		if err = deps.Engine.GatewayHealth(ctx, gateway, spec.HealthToken); err != nil {
-			return 0, fmt.Errorf("authenticate filtering gateway: %w", err)
-		}
-		commandNetworkTarget = gateway.ID
+	req := deps.NetworkRequest
+	req.Plan = plan
+	networkSession, err := deps.Network.Begin(ctx, req)
+	if err != nil {
+		return 0, fmt.Errorf("start isolated network session: %w", err)
 	}
+	plan.InvocationID = networkSession.InvocationID()
+	commandNetworkTarget := networkSession.GatewayID()
 	command, err := deps.Engine.StartCommand(ctx, plan, commandNetworkTarget, streams.TTY)
 	if err != nil {
 		return 0, fmt.Errorf("create command: %w", err)

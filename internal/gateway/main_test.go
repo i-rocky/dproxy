@@ -2,6 +2,10 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
+	networkpolicy "dproxy/internal/network"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -23,7 +27,7 @@ func TestServePublishesAuthenticatedReadinessOnlyAfterControls(t *testing.T) {
 	require.NoError(t, os.WriteFile(policyPath, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- Serve(ctx, policyPath, ready, &fakeControls{}) }()
+	go func() { done <- ServeWithToken(ctx, policyPath, ready, "token", &fakeControls{}) }()
 	require.Eventually(t, func() bool { return Health(ready, "token", "token") == nil }, time.Second, time.Millisecond)
 	require.Error(t, Health(ready, "token", "wrong"))
 	cancel()
@@ -35,9 +39,28 @@ func TestServeDoesNotPublishReadinessOnSetupFailure(t *testing.T) {
 	policyPath := filepath.Join(dir, "policy.json")
 	ready := filepath.Join(dir, "ready")
 	require.NoError(t, os.WriteFile(policyPath, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
-	require.Error(t, Serve(context.Background(), policyPath, ready, &fakeControls{fail: "udp"}))
+	require.Error(t, ServeWithToken(context.Background(), policyPath, ready, "token", &fakeControls{fail: "udp"}))
 	_, err := os.Stat(ready)
 	require.ErrorIs(t, err, os.ErrNotExist)
+}
+func TestServeAndHealthRejectEmptyOrMismatchedTokens(t *testing.T) {
+	dir := t.TempDir()
+	policy := filepath.Join(dir, "policy")
+	ready := filepath.Join(dir, "ready")
+	require.NoError(t, os.WriteFile(policy, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
+	require.ErrorContains(t, ServeWithToken(context.Background(), policy, ready, "", &fakeControls{}), "nonempty")
+	empty := sha256.Sum256(nil)
+	record, _ := json.Marshal(readiness{Controls: readyState, TokenHash: hex.EncodeToString(empty[:])})
+	require.NoError(t, os.WriteFile(ready, record, 0400))
+	require.Error(t, Health(ready, "token", "token"))
+	require.Error(t, Health(ready, "", ""))
+}
+func TestHealthRejectsWritableReadinessState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ready")
+	h := sha256.Sum256([]byte("token"))
+	record, _ := json.Marshal(readiness{Controls: readyState, TokenHash: hex.EncodeToString(h[:])})
+	require.NoError(t, os.WriteFile(path, record, 0600))
+	require.ErrorContains(t, Health(path, "token", "token"), "mode")
 }
 
 type fakeInspector struct {
@@ -59,7 +82,7 @@ func (f *fakeInspector) DNS(n, _ string) error {
 	}
 	return nil
 }
-func (f *fakeInspector) NFT() error {
+func (f *fakeInspector) NFT(networkpolicy.Policy) error {
 	f.calls = append(f.calls, "nft")
 	if f.fail == "nft" {
 		return errors.New("bad")
@@ -82,7 +105,7 @@ func TestRealHealthAdaptersFailClosedWithoutControls(t *testing.T) {
 	_ = i.Forwarding("ipv6")
 	require.Error(t, i.DNS("tcp", "127.0.0.1:1"))
 	require.Error(t, i.DNS("udp", "127.0.0.1:1"))
-	require.Error(t, i.NFT())
+	require.Error(t, i.NFT(networkpolicy.Public()))
 }
 func TestSystemHealthChecksPolicyHashBeforeKernel(t *testing.T) {
 	dir := t.TempDir()
@@ -94,7 +117,8 @@ func TestSystemHealthChecksPolicyHashBeforeKernel(t *testing.T) {
 	go func() { done <- ServeWithToken(ctx, policy, ready, "token", &fakeControls{}) }()
 	require.Eventually(t, func() bool { _, e := os.Stat(ready); return e == nil }, time.Second, time.Millisecond)
 	require.NoError(t, os.Chmod(policy, 0600))
-	require.NoError(t, os.WriteFile(policy, []byte("changed"), 0600))
+	require.NoError(t, os.WriteFile(policy, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8","10.0.0.0/8"]}`), 0600))
+	require.NoError(t, os.Chmod(policy, 0400))
 	require.ErrorContains(t, SystemHealth(ready, policy, "token", "token", "127.0.0.1:1"), "hash")
 	cancel()
 	<-done

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
-	"sort"
 	"syscall"
 	"time"
 
@@ -56,15 +55,17 @@ func BuildRulePlan(p networkpolicy.Policy) ([]RuleSpec, error) {
 	if p.Mode == "public" {
 		r = append(r, RuleSpec{Kind: RulePublic})
 	} else {
-		ports := append([]uint16(nil), p.Ports...)
-		sort.Slice(ports, func(i, j int) bool { return ports[i] < ports[j] })
-		r = append(r, RuleSpec{Kind: RulePinned, Family: "ip", Ports: ports}, RuleSpec{Kind: RulePinned, Family: "ip6", Ports: ports})
+		r = append(r, RuleSpec{Kind: RulePinned, Family: "ip"}, RuleSpec{Kind: RulePinned, Family: "ip6"})
 	}
 	return append(r, RuleSpec{Kind: RuleDefaultDrop}), nil
 }
 
 type Pinner interface {
-	Pin(context.Context, []netip.Addr, time.Duration) error
+	Pin(context.Context, []PinnedEndpoint, time.Duration) error
+}
+type PinnedEndpoint struct {
+	Addr netip.Addr
+	Port uint16
 }
 type DNSExchanger interface {
 	ExchangeContext(context.Context, *dns.Msg, string) (*dns.Msg, time.Duration, error)
@@ -153,7 +154,17 @@ func (p *DNSProxy) resolve(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
 		if ttl <= 0 {
 			ttl = time.Second
 		}
-		if err = p.Pinner.Pin(ctx, addrs, ttl); err != nil {
+		ports := p.Policy.PortsForDomain(host)
+		if len(ports) == 0 {
+			return nil, errors.New("domain has no allowed ports")
+		}
+		pins := make([]PinnedEndpoint, 0, len(addrs)*len(ports))
+		for _, a := range addrs {
+			for _, port := range ports {
+				pins = append(pins, PinnedEndpoint{Addr: a, Port: port})
+			}
+		}
+		if err = p.Pinner.Pin(ctx, pins, ttl); err != nil {
 			return nil, fmt.Errorf("pin DNS answers: %w", err)
 		}
 	}
