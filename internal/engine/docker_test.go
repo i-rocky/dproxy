@@ -39,6 +39,7 @@ type fakeDockerAPI struct {
 	networkLabels   map[string]string
 	resize          container.ResizeOptions
 	inspectErr      error
+	killedSignal    string
 }
 
 func (f *fakeDockerAPI) Info(context.Context) (system.Info, error)            { return f.info, nil }
@@ -70,7 +71,10 @@ func (f *fakeDockerAPI) ContainerWait(context.Context, string, container.WaitCon
 	s <- container.WaitResponse{StatusCode: 23}
 	return s, e
 }
-func (f *fakeDockerAPI) ContainerKill(context.Context, string, string) error { return nil }
+func (f *fakeDockerAPI) ContainerKill(_ context.Context, _ string, signal string) error {
+	f.killedSignal = signal
+	return nil
+}
 func (f *fakeDockerAPI) ContainerResize(_ context.Context, _ string, o container.ResizeOptions) error {
 	f.resize = o
 	return nil
@@ -247,6 +251,22 @@ func TestDockerResizeMapsHeightAndWidth(t *testing.T) {
 
 func TestDockerNeverSendsWINCHThroughContainerKill(t *testing.T) {
 	require.ErrorContains(t, NewDocker(&fakeDockerAPI{}).Signal(context.Background(), "command", syscall.SIGWINCH), "resize")
+}
+
+func TestDockerMapsOnlySupportedSignalsExplicitly(t *testing.T) {
+	for name, tc := range map[string]struct {
+		signal os.Signal
+		want   string
+	}{"interrupt": {syscall.SIGINT, "SIGINT"}, "terminate": {syscall.SIGTERM, "SIGTERM"}} {
+		t.Run(name, func(t *testing.T) {
+			api := &fakeDockerAPI{}
+			require.NoError(t, NewDocker(api).Signal(context.Background(), "command", tc.signal))
+			require.Equal(t, tc.want, api.killedSignal)
+		})
+	}
+	api := &fakeDockerAPI{}
+	require.ErrorContains(t, NewDocker(api).Signal(context.Background(), "command", syscall.SIGHUP), "unsupported")
+	require.Empty(t, api.killedSignal)
 }
 
 type closedWaitAPI struct{}

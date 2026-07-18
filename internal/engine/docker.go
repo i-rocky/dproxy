@@ -305,11 +305,20 @@ func (d *Docker) Signal(ctx context.Context, id string, s os.Signal) error {
 	if s == syscall.SIGWINCH {
 		return errors.New("SIGWINCH requires terminal resize")
 	}
+	var dockerSignal string
+	switch s {
+	case syscall.SIGINT:
+		dockerSignal = "SIGINT"
+	case syscall.SIGTERM:
+		dockerSignal = "SIGTERM"
+	default:
+		return errors.New("unsupported command signal")
+	}
 	a, ok := d.api.(signalAPI)
 	if !ok {
 		return errors.New("engine does not provide signal API")
 	}
-	return a.ContainerKill(ctx, id, s.String())
+	return a.ContainerKill(ctx, id, dockerSignal)
 }
 
 type removeAPI interface {
