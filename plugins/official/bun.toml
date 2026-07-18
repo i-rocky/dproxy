@@ -1,0 +1,13 @@
+schema = 1
+name = "bun"
+bins = ["bun", "bunx"]
+commands = { bun = ["bun"], bunx = ["bunx"] }
+[images.default]
+repository = "docker.io/oven/bun"
+tag = "{{version}}"
+[[caches]]
+path = "/home/bun/.bun/install/cache"
+compatibility = "major"
+[[platforms]]
+os = "linux"
+arch = "amd64"

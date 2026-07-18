@@ -1,0 +1,13 @@
+schema = 1
+name = "node"
+bins = ["node", "npm", "npx"]
+commands = { node = ["node"], npm = ["npm"], npx = ["npx"] }
+[images.default]
+repository = "docker.io/library/node"
+tag = "{{version}}"
+[[caches]]
+path = "/home/node/.npm"
+compatibility = "major"
+[[platforms]]
+os = "linux"
+arch = "amd64"

@@ -1,0 +1,13 @@
+schema = 1
+name = "go"
+bins = ["go", "gofmt"]
+commands = { go = ["go"], gofmt = ["gofmt"] }
+[images.default]
+repository = "docker.io/library/golang"
+tag = "{{version}}"
+[[caches]]
+path = "/go/pkg/mod"
+compatibility = "minor"
+[[platforms]]
+os = "linux"
+arch = "amd64"

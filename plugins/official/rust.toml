@@ -1,0 +1,13 @@
+schema = 1
+name = "rust"
+bins = ["cargo", "rustc", "rustfmt"]
+commands = { cargo = ["cargo"], rustc = ["rustc"], rustfmt = ["rustfmt"] }
+[images.default]
+repository = "docker.io/library/rust"
+tag = "{{version}}"
+[[caches]]
+path = "/usr/local/cargo/registry"
+compatibility = "minor"
+[[platforms]]
+os = "linux"
+arch = "amd64"
