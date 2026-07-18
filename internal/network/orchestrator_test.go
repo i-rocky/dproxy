@@ -2,8 +2,11 @@ package network
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/netip"
+	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -17,12 +20,17 @@ type fakeEngine struct {
 	mu            sync.Mutex
 	healthErr     error
 	subnetErr     error
+	subnets       []netip.Prefix
 	invocations   []string
 	rollbackCalls []string
+	gatewayPolicy Policy
 }
 
 func (f *fakeEngine) ActiveDockerSubnets(context.Context) ([]netip.Prefix, error) {
-	return []netip.Prefix{netip.MustParsePrefix("198.18.0.0/15")}, f.subnetErr
+	if f.subnets != nil {
+		return f.subnets, f.subnetErr
+	}
+	return []netip.Prefix{netip.MustParsePrefix("203.0.114.0/24")}, f.subnetErr
 }
 
 func (f *fakeEngine) CreateNetwork(_ context.Context, p corepolicy.Plan) (engine.Resource, error) {
@@ -32,7 +40,36 @@ func (f *fakeEngine) CreateNetwork(_ context.Context, p corepolicy.Plan) (engine
 	return engine.Resource{ID: "network-" + p.InvocationID, Ownership: engine.Ownership{ProjectID: p.ProjectID, InvocationID: p.InvocationID}, Role: "network"}, nil
 }
 func (f *fakeEngine) StartGateway(_ context.Context, s engine.GatewaySpec) (engine.Resource, error) {
+	b, _ := os.ReadFile(s.PolicyPath)
+	var captured Policy
+	_ = json.Unmarshal(b, &captured)
+	f.mu.Lock()
+	f.gatewayPolicy = captured
+	f.mu.Unlock()
 	return engine.Resource{ID: "gateway-" + s.Ownership.InvocationID, Ownership: s.Ownership, Role: engine.GatewayRole}, nil
+}
+func TestRequestCannotCarryPrebuiltDenyPolicy(t *testing.T) {
+	_, ok := reflect.TypeOf(Request{}).FieldByName("Policy")
+	require.False(t, ok)
+}
+func TestStartBuildsMandatoryPolicyAndEngineSubnetsInternally(t *testing.T) {
+	e := &fakeEngine{}
+	s, err := NewOrchestrator(e).Start(context.Background(), publicRequest())
+	require.NoError(t, err)
+	require.NoError(t, e.gatewayPolicy.ValidateBaseline())
+	require.Contains(t, e.gatewayPolicy.DeniedPrefixes, "203.0.114.0/24")
+	require.NoError(t, s.Close(context.Background()))
+}
+func TestAllowlistStartBuildsEndpointsFromPlanIntent(t *testing.T) {
+	e := &fakeEngine{}
+	r := publicRequest()
+	r.Plan.Network = corepolicy.Network{Mode: "allowlist", Allowlist: []string{"a.example:443", "b.example:80"}}
+	s, err := NewOrchestrator(e).Start(context.Background(), r)
+	require.NoError(t, err)
+	require.True(t, e.gatewayPolicy.AllowsEndpoint("a.example", 443))
+	require.False(t, e.gatewayPolicy.AllowsEndpoint("a.example", 80))
+	require.Contains(t, e.gatewayPolicy.DeniedPrefixes, "203.0.114.0/24")
+	require.NoError(t, s.Close(context.Background()))
 }
 func (f *fakeEngine) GatewayHealth(context.Context, engine.Resource, string) error {
 	return f.healthErr
@@ -51,7 +88,7 @@ func (f *fakeEngine) RemoveNetwork(context.Context, engine.Resource) error {
 }
 
 func publicRequest() Request {
-	return Request{Plan: corepolicy.Plan{ProjectID: "project", Network: corepolicy.Network{Mode: "public"}}, Policy: Public(), GatewayImage: "ghcr.io/dproxy/gateway@sha256:" + strings.Repeat("a", 64), EgressNetworkID: "bridge"}
+	return Request{Plan: corepolicy.Plan{ProjectID: "project", Network: corepolicy.Network{Mode: "public"}}, GatewayImage: "ghcr.io/dproxy/gateway@sha256:" + strings.Repeat("a", 64), EgressNetworkID: "bridge"}
 }
 
 func TestStartRollsBackOnGatewayHealthFailure(t *testing.T) {

@@ -20,11 +20,18 @@ type fakeControls struct {
 	fail  string
 }
 
+func writePublicPolicy(t *testing.T, path string) {
+	t.Helper()
+	b, err := json.Marshal(networkpolicy.Public())
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, b, 0400))
+}
+
 func TestServePublishesAuthenticatedReadinessOnlyAfterControls(t *testing.T) {
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.json")
 	ready := filepath.Join(dir, "ready")
-	require.NoError(t, os.WriteFile(policyPath, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
+	writePublicPolicy(t, policyPath)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- ServeWithToken(ctx, policyPath, ready, "token", &fakeControls{}) }()
@@ -38,7 +45,7 @@ func TestServeDoesNotPublishReadinessOnSetupFailure(t *testing.T) {
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.json")
 	ready := filepath.Join(dir, "ready")
-	require.NoError(t, os.WriteFile(policyPath, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
+	writePublicPolicy(t, policyPath)
 	require.Error(t, ServeWithToken(context.Background(), policyPath, ready, "token", &fakeControls{fail: "udp"}))
 	_, err := os.Stat(ready)
 	require.ErrorIs(t, err, os.ErrNotExist)
@@ -47,7 +54,7 @@ func TestServeAndHealthRejectEmptyOrMismatchedTokens(t *testing.T) {
 	dir := t.TempDir()
 	policy := filepath.Join(dir, "policy")
 	ready := filepath.Join(dir, "ready")
-	require.NoError(t, os.WriteFile(policy, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
+	writePublicPolicy(t, policy)
 	require.ErrorContains(t, ServeWithToken(context.Background(), policy, ready, "", &fakeControls{}), "nonempty")
 	empty := sha256.Sum256(nil)
 	record, _ := json.Marshal(readiness{Controls: readyState, TokenHash: hex.EncodeToString(empty[:])})
@@ -111,13 +118,17 @@ func TestSystemHealthChecksPolicyHashBeforeKernel(t *testing.T) {
 	dir := t.TempDir()
 	policy := filepath.Join(dir, "policy")
 	ready := filepath.Join(dir, "ready")
-	require.NoError(t, os.WriteFile(policy, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
+	writePublicPolicy(t, policy)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- ServeWithToken(ctx, policy, ready, "token", &fakeControls{}) }()
 	require.Eventually(t, func() bool { _, e := os.Stat(ready); return e == nil }, time.Second, time.Millisecond)
 	require.NoError(t, os.Chmod(policy, 0600))
-	require.NoError(t, os.WriteFile(policy, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8","10.0.0.0/8"]}`), 0600))
+	changed := networkpolicy.Public()
+	changed.DeniedPrefixes = append(changed.DeniedPrefixes, "203.0.113.0/25")
+	changedBytes, marshalErr := json.Marshal(changed)
+	require.NoError(t, marshalErr)
+	require.NoError(t, os.WriteFile(policy, changedBytes, 0600))
 	require.NoError(t, os.Chmod(policy, 0400))
 	require.ErrorContains(t, SystemHealth(ready, policy, "token", "token", "127.0.0.1:1"), "hash")
 	cancel()
@@ -167,7 +178,7 @@ func TestSetupFailsUnlessEveryTransparentControlIsInstalled(t *testing.T) {
 func TestLoadPolicyRequiresReadOnlyRegularJSON(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "policy.json")
-	require.NoError(t, os.WriteFile(path, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
+	writePublicPolicy(t, path)
 	p, err := LoadPolicy(path)
 	require.NoError(t, err)
 	require.Equal(t, "public", p.Mode)
@@ -193,4 +204,10 @@ func TestLoadPolicyRejectsEveryIncompleteState(t *testing.T) {
 		require.Error(t, err)
 		require.NoError(t, os.Chmod(path, 0600))
 	}
+}
+func TestLoadPolicyRejectsSyntacticallyValidWeakenedBaseline(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "policy")
+	require.NoError(t, os.WriteFile(path, []byte(`{"mode":"public","denied_prefixes":["127.0.0.0/8"]}`), 0400))
+	_, err := LoadPolicy(path)
+	require.ErrorContains(t, err, "baseline")
 }

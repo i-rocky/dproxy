@@ -97,6 +97,9 @@ func LoadPolicy(path string) (networkpolicy.Policy, error) {
 			return networkpolicy.Policy{}, errors.New("invalid protected prefix")
 		}
 	}
+	if err = p.ValidateBaseline(); err != nil {
+		return networkpolicy.Policy{}, fmt.Errorf("validate mandatory deny baseline: %w", err)
+	}
 	return p, nil
 }
 func ensureEOF(dec *json.Decoder) error {

@@ -27,7 +27,6 @@ type GatewayEngine interface {
 
 type Request struct {
 	Plan            corepolicy.Plan
-	Policy          Policy
 	GatewayImage    string
 	EgressNetworkID string
 	StateDir        string
@@ -123,9 +122,6 @@ func (o *Orchestrator) Start(ctx context.Context, req Request) (_ *Session, err 
 	if req.Plan.Network.Mode != "none" && req.Plan.Network.Mode != "public" && req.Plan.Network.Mode != "allowlist" {
 		return nil, errors.New("unsupported network mode")
 	}
-	if req.Plan.Network.Mode != "none" && req.Policy.Mode != req.Plan.Network.Mode {
-		return nil, errors.New("gateway policy mode does not match command plan")
-	}
 	id, err := invocationID()
 	if err != nil {
 		return nil, err
@@ -144,18 +140,26 @@ func (o *Orchestrator) Start(ctx context.Context, req Request) (_ *Session, err 
 	if req.StateDir == "" {
 		req.StateDir = os.TempDir()
 	}
-	if source, ok := o.engine.(interface {
+	source, ok := o.engine.(interface {
 		ActiveDockerSubnets(context.Context) ([]netip.Prefix, error)
-	}); ok {
-		subnets, e := source.ActiveDockerSubnets(ctx)
+	})
+	if !ok {
+		return nil, errors.New("engine does not provide protected subnet discovery")
+	}
+	subnets, e := source.ActiveDockerSubnets(ctx)
+	if e != nil {
+		return nil, fmt.Errorf("discover protected Docker networks: %w", e)
+	}
+	var gatewayPolicy Policy
+	if req.Plan.Network.Mode == "public" {
+		gatewayPolicy = Public(subnets...)
+	} else {
+		gatewayPolicy, e = Allowlist(req.Plan.Network.Allowlist, subnets...)
 		if e != nil {
-			return nil, fmt.Errorf("discover protected Docker networks: %w", e)
-		}
-		for _, prefix := range subnets {
-			req.Policy.DeniedPrefixes = append(req.Policy.DeniedPrefixes, prefix.Masked().String())
+			return nil, fmt.Errorf("build canonical gateway allowlist: %w", e)
 		}
 	}
-	policyPath, err := writePolicy(req.StateDir, id, req.Policy)
+	policyPath, err := writePolicy(req.StateDir, id, gatewayPolicy)
 	if err != nil {
 		return nil, err
 	}

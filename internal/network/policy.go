@@ -46,6 +46,30 @@ func Public(dockerSubnets ...netip.Prefix) Policy {
 	}
 	return p
 }
+func (p Policy) ValidateBaseline() error {
+	denied := make([]netip.Prefix, 0, len(p.DeniedPrefixes))
+	for _, raw := range p.DeniedPrefixes {
+		prefix, err := netip.ParsePrefix(raw)
+		if err != nil {
+			return errors.New("invalid denied prefix")
+		}
+		denied = append(denied, prefix.Masked())
+	}
+	for _, raw := range specialPrefixes {
+		mandatory := netip.MustParsePrefix(raw).Masked()
+		covered := false
+		for _, candidate := range denied {
+			if candidate.Addr().BitLen() == mandatory.Addr().BitLen() && candidate.Bits() <= mandatory.Bits() && candidate.Contains(mandatory.Addr()) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return errors.New("policy omits mandatory deny baseline")
+		}
+	}
+	return nil
+}
 
 // Allowlist accepts host:port entries. Requiring the port avoids a domain entry
 // silently granting every service on that host.

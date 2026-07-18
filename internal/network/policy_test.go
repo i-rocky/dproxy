@@ -56,6 +56,17 @@ func TestPolicyFailsClosedForInvalidState(t *testing.T) {
 	_, err = Allowlist([]string{"example.com:0"})
 	require.Error(t, err)
 }
+func TestValidateBaselineRejectsAnyMissingMandatoryPrefix(t *testing.T) {
+	p := Public()
+	require.NoError(t, p.ValidateBaseline())
+	p.DeniedPrefixes = p.DeniedPrefixes[1:]
+	require.Error(t, p.ValidateBaseline())
+}
+func TestValidateBaselineAcceptsMoreRestrictiveCoverage(t *testing.T) {
+	p := Public()
+	p.DeniedPrefixes = []string{"0.0.0.0/0", "::/0"}
+	require.NoError(t, p.ValidateBaseline())
+}
 
 func FuzzPolicyNeverAllowsInvalidAddress(f *testing.F) {
 	for _, s := range []string{"127.0.0.1", "::ffff:127.0.0.1", "93.184.216.34"} {
