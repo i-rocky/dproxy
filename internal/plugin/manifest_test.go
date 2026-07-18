@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pelletier/go-toml/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,6 +52,8 @@ func TestManifestValidation(t *testing.T) {
 		strings.Replace(valid, `bins=["x"]`, `bins=["x","x"]`, 1),
 		strings.Replace(valid, `bins=["x"]`, `bins=[]`, 1),
 		strings.Replace(valid, `commands={x=["x"]}`, `commands={x=["other"]}`, 1),
+		strings.Replace(valid, `commands={x=["x"]}`, `commands={x=["x",""]}`, 1),
+		strings.Replace(valid, `commands={x=["x"]}`, `commands={x=["x","bad\\u0001arg"]}`, 1),
 		strings.Replace(valid, `commands={x=["x"]}`, `commands={x=["x"],y=["y"]}`, 1),
 		strings.Replace(valid, `repository="registry.example/x"`, `repository=""`, 1),
 		strings.Replace(valid, `repository="registry.example/x"`, `repository="HTTPS://registry.example/x:tag"`, 1),
@@ -64,6 +67,7 @@ func TestManifestValidation(t *testing.T) {
 		strings.Replace(valid, `tag_template="{version}"`, `tag_template="`+strings.Repeat("a", 129)+`{version}"`, 1),
 		valid + "[[caches]]\npath=\"relative\"\n",
 		valid + "[[caches]]\npath=\"/tmp/../cache\"\n",
+		valid + "[[caches]]\npath=\"/cache\"\n[[caches]]\npath=\"/cache\"\n",
 		valid + "[environment]\n\"BAD=KEY\"=\"x\"\n",
 		valid + "[[platforms]]\nos=\"linux\"\narch=\"\"\n",
 	}
@@ -71,4 +75,21 @@ func TestManifestValidation(t *testing.T) {
 		_, err := LoadManifest(strings.NewReader(input))
 		require.Error(t, err)
 	}
+}
+
+func TestValidateRejectsProgrammaticManifestMutation(t *testing.T) {
+	manifest, err := LoadManifest(strings.NewReader("schema=1\nname=\"x\"\nbins=[\"x\"]\ncommands={x=[\"x\"]}\n[images.default]\nrepository=\"registry.example/x\"\ntag_template=\"{version}\"\n"))
+	require.NoError(t, err)
+	manifest.Commands["x"][0] = "other"
+	require.Error(t, Validate(manifest))
+}
+
+func TestManifestProvenanceIsNotSerializedAsManifestData(t *testing.T) {
+	manifest, err := LoadManifest(strings.NewReader("schema=1\nname=\"x\"\nbins=[\"x\"]\ncommands={x=[\"x\"]}\n[images.default]\nrepository=\"registry.example/x\"\ntag_template=\"{version}\"\n"))
+	require.NoError(t, err)
+	manifest.Provenance = Provenance{Repository: "https://secret.example/plugins", Commit: strings.Repeat("a", 40), ManifestSHA256: strings.Repeat("b", 64), Schema: 1}
+	raw, err := toml.Marshal(manifest)
+	require.NoError(t, err)
+	require.NotContains(t, string(raw), "secret.example")
+	require.NotContains(t, string(raw), "manifestsha")
 }

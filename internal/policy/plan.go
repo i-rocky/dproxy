@@ -54,6 +54,9 @@ type Input struct {
 var reserved = map[string]struct{}{"HOME": {}, "PATH": {}, "HOSTNAME": {}, "DOCKER_HOST": {}, "SSH_AUTH_SOCK": {}, "GPG_AGENT_INFO": {}, "XDG_CACHE_HOME": {}, "XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}}
 
 func Build(in Input) (Plan, error) {
+	if err := plugin.Validate(in.Manifest); err != nil {
+		return Plan{}, fmt.Errorf("invalid plugin manifest: %w", err)
+	}
 	if in.InvocationID == "" || in.ProjectID == "" {
 		return Plan{}, errors.New("missing execution identity")
 	}

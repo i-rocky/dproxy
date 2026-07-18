@@ -80,6 +80,7 @@ func TestStoreAddsSyncsAndResolvesLiteralRepositoryURL(t *testing.T) {
 	manifest, err := s.Resolve("tool")
 	require.NoError(t, err)
 	require.Equal(t, "tool", manifest.Name)
+	require.Equal(t, Provenance{Repository: repositoryURL, Commit: commit, ManifestSHA256: repository.ManifestHashes["tool.toml"], Schema: 1}, manifest.Provenance)
 	_, err = s.Resolve("missing")
 	require.ErrorIs(t, err, ErrNotFound)
 	_, err = s.Sync(context.Background(), repository.Name)

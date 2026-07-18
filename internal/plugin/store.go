@@ -200,6 +200,7 @@ func (s *Store) Resolve(binary string) (Manifest, error) {
 					if found {
 						return Manifest{}, fault.New("resolve plugin", "ambiguous provider", ErrAmbiguous)
 					}
+					manifest.Provenance = Provenance{Repository: repository.URL, Commit: repository.Commit, ManifestSHA256: expected, Schema: manifest.Schema}
 					result, found = manifest, true
 				}
 			}

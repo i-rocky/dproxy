@@ -23,7 +23,7 @@ func (f fakeRegistry) Tags(context.Context, string) ([]string, error) {
 func (f fakeRegistry) Digest(context.Context, string, string) (string, error) { return f.digest, f.err }
 
 func manifests() map[string]plugin.Manifest {
-	return map[string]plugin.Manifest{"node": {Schema: 1, Name: "node", Images: map[string]plugin.Image{"default": {Repository: "docker.io/library/node", TagTemplate: "{version}"}}, Platforms: []plugin.Platform{{OS: "linux", Arch: "amd64"}}}}
+	return map[string]plugin.Manifest{"node": {Schema: 1, Name: "node", Bins: []string{"node"}, Commands: map[string][]string{"node": {"node"}}, Images: map[string]plugin.Image{"default": {Repository: "docker.io/library/node", TagTemplate: "{version}"}}, Platforms: []plugin.Platform{{OS: "linux", Arch: "amd64"}}, Provenance: plugin.Provenance{Repository: "https://example.test/plugins.git", Commit: strings.Repeat("b", 40), ManifestSHA256: strings.Repeat("c", 64), Schema: 1}}}
 }
 
 func TestResolveHighestMatchingDigest(t *testing.T) {
@@ -32,6 +32,35 @@ func TestResolveHighestMatchingDigest(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "24.4.1", got.Tools["node"].Version)
 	require.Equal(t, reg.digest, got.Tools["node"].Digest)
+	require.Equal(t, strings.Repeat("c", 64), got.Plugins["node"].ManifestSHA256)
+}
+
+func TestResolveRequiresValidConfigHashAndProvenance(t *testing.T) {
+	reg := fakeRegistry{tags: []string{"24.0.0"}, digest: "sha256:" + strings.Repeat("d", 64)}
+	_, err := Resolve(context.Background(), config.Config{Tools: map[string]string{"node": "24"}}, manifests(), "linux/amd64", "bad", reg)
+	require.Error(t, err)
+	without := manifests()
+	m := without["node"]
+	m.Provenance = plugin.Provenance{}
+	without["node"] = m
+	_, err = Resolve(context.Background(), config.Config{Tools: map[string]string{"node": "24"}}, without, "linux/amd64", strings.Repeat("a", 64), reg)
+	require.Error(t, err)
+}
+
+func TestResolveDeduplicatesAndRejectsConflictingProviderProvenance(t *testing.T) {
+	ms := manifests()
+	second := ms["node"]
+	second.Name = "node"
+	ms["npm"] = second
+	cfg := config.Config{Tools: map[string]string{"node": "24", "npm": "24"}}
+	reg := fakeRegistry{tags: []string{"24.0.0"}, digest: "sha256:" + strings.Repeat("d", 64)}
+	got, err := Resolve(context.Background(), cfg, ms, "linux/amd64", strings.Repeat("a", 64), reg)
+	require.NoError(t, err)
+	require.Len(t, got.Plugins, 1)
+	second.Provenance.Commit = strings.Repeat("e", 40)
+	ms["npm"] = second
+	_, err = Resolve(context.Background(), cfg, ms, "linux/amd64", strings.Repeat("a", 64), reg)
+	require.Error(t, err)
 }
 
 func TestResolveRejectsUntrustedResolution(t *testing.T) {

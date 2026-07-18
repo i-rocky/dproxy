@@ -2,6 +2,7 @@ package lock
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,6 +60,13 @@ func TestFileVerifyFailsClosed(t *testing.T) {
 		},
 		func(f *File) { x := f.Tools["node"]; x.Platform = "linux/arm64"; f.Tools["node"] = x },
 		func(f *File) { x := f.Plugins["node"]; x.ManifestSHA256 = "bad"; f.Plugins["node"] = x },
+		func(f *File) { x := f.Plugins["node"]; x.Commit = strings.Repeat("B", 40); f.Plugins["node"] = x },
+		func(f *File) { x := f.Plugins["node"]; x.Commit = strings.Repeat("b", 41); f.Plugins["node"] = x },
+		func(f *File) {
+			x := f.Plugins["node"]
+			x.Repository = "http://example.test/plugins"
+			f.Plugins["node"] = x
+		},
 	}
 	for i, mutate := range cases {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
@@ -68,6 +76,48 @@ func TestFileVerifyFailsClosed(t *testing.T) {
 		})
 	}
 	require.Error(t, f.Verify(strings.Repeat("e", 64), "linux/amd64"))
+}
+
+func TestWriteAtomicRenameFailurePreservesExistingLockAndCleansTemporary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lock")
+	require.NoError(t, os.WriteFile(path, []byte("original"), 0600))
+	old := renameFile
+	renameFile = func(string, string) error { return errors.New("injected rename failure") }
+	t.Cleanup(func() { renameFile = old })
+	require.Error(t, WriteAtomic(path, validFile()))
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "original", string(raw))
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+}
+
+func TestWriteAtomicReportsDirectorySyncFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lock")
+	old := syncParent
+	syncParent = func(string) error { return errors.New("injected sync failure") }
+	t.Cleanup(func() { syncParent = old })
+	require.Error(t, WriteAtomic(path, validFile()))
+	_, err := os.Stat(path)
+	require.NoError(t, err)
+}
+
+func TestWriteAtomicFileSyncFailurePreservesExistingLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lock")
+	require.NoError(t, os.WriteFile(path, []byte("original"), 0600))
+	old := syncFile
+	syncFile = func(*os.File) error { return errors.New("injected file sync failure") }
+	t.Cleanup(func() { syncFile = old })
+	require.Error(t, WriteAtomic(path, validFile()))
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "original", string(raw))
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
 }
 
 func TestHashConfig(t *testing.T) {

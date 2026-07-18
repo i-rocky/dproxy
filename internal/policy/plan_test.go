@@ -22,7 +22,7 @@ func validInput(t *testing.T, binary string, args []string) Input {
 	return Input{InvocationID: "inv", ProjectID: "project", ProjectRoot: root, RelativeWorkdir: ".", CacheRoot: cacheRoot, Platform: "linux/amd64",
 		CachePaths: map[string]string{"/home/node/.npm": cache}, Binary: binary, Arguments: args, UID: 1000, GID: 1000,
 		Tool:     lock.Tool{Image: "docker.io/library/node", Tag: "24.4.1", Digest: digest, Platform: "linux/amd64", Version: "24.4.1", Requested: "24"},
-		Manifest: plugin.Manifest{Name: "node", Commands: map[string][]string{"npm": {"npm"}}, Caches: []plugin.Cache{{Path: "/home/node/.npm"}}, Environment: map[string]string{"NODE_ENV": "production"}},
+		Manifest: plugin.Manifest{Schema: 1, Name: "node", Bins: []string{"npm"}, Commands: map[string][]string{"npm": {"npm"}}, Images: map[string]plugin.Image{"default": {Repository: "docker.io/library/node", TagTemplate: "{version}"}}, Caches: []plugin.Cache{{Path: "/home/node/.npm"}}, Environment: map[string]string{"NODE_ENV": "production"}, Platforms: []plugin.Platform{{OS: "linux", Arch: "amd64"}}},
 		Sandbox:  config.Sandbox{Network: "none", Memory: "4GiB", CPUs: 2, PIDs: 128, Environment: map[string]string{"CI": "true"}, Ports: map[string]int{"3000": 3000}}}
 }
 
@@ -56,20 +56,22 @@ func TestBuildCopiesCollections(t *testing.T) {
 
 func TestBuildRejectsUnsafeInputs(t *testing.T) {
 	cases := map[string]func(*Input){
-		"unknown command":     func(i *Input) { i.Binary = "sh" },
-		"unlocked image":      func(i *Input) { i.Tool.Digest = "latest" },
-		"wrong platform":      func(i *Input) { i.Platform = "linux/arm64" },
-		"root project":        func(i *Input) { i.ProjectRoot = "/" },
-		"outside workdir":     func(i *Input) { i.RelativeWorkdir = "../escape" },
-		"reserved env":        func(i *Input) { i.Sandbox.Environment["HOME"] = "/host" },
-		"reserved plugin env": func(i *Input) { i.Manifest.Environment["PATH"] = "/evil" },
-		"invalid env":         func(i *Input) { i.Sandbox.Environment["BAD=KEY"] = "x" },
-		"unsafe port":         func(i *Input) { i.Sandbox.Ports = map[string]int{"0": 3000} },
-		"bad pids":            func(i *Input) { i.Sandbox.PIDs = -1 },
-		"bad cpu":             func(i *Input) { i.Sandbox.CPUs = 65 },
-		"bad memory":          func(i *Input) { i.Sandbox.Memory = "unlimited" },
-		"unknown network":     func(i *Input) { i.Sandbox.Network = "host" },
-		"missing cache":       func(i *Input) { i.CachePaths = map[string]string{} },
+		"unknown command":        func(i *Input) { i.Binary = "sh" },
+		"mutated command prefix": func(i *Input) { i.Manifest.Commands["npm"][0] = "sh" },
+		"command control":        func(i *Input) { i.Manifest.Commands["npm"] = []string{"npm", "bad\narg"} },
+		"unlocked image":         func(i *Input) { i.Tool.Digest = "latest" },
+		"wrong platform":         func(i *Input) { i.Platform = "linux/arm64" },
+		"root project":           func(i *Input) { i.ProjectRoot = "/" },
+		"outside workdir":        func(i *Input) { i.RelativeWorkdir = "../escape" },
+		"reserved env":           func(i *Input) { i.Sandbox.Environment["HOME"] = "/host" },
+		"reserved plugin env":    func(i *Input) { i.Manifest.Environment["PATH"] = "/evil" },
+		"invalid env":            func(i *Input) { i.Sandbox.Environment["BAD=KEY"] = "x" },
+		"unsafe port":            func(i *Input) { i.Sandbox.Ports = map[string]int{"0": 3000} },
+		"bad pids":               func(i *Input) { i.Sandbox.PIDs = -1 },
+		"bad cpu":                func(i *Input) { i.Sandbox.CPUs = 65 },
+		"bad memory":             func(i *Input) { i.Sandbox.Memory = "unlimited" },
+		"unknown network":        func(i *Input) { i.Sandbox.Network = "host" },
+		"missing cache":          func(i *Input) { i.CachePaths = map[string]string{} },
 		"protected cache target": func(i *Input) {
 			i.Manifest.Caches[0].Path = "/tmp/cache"
 			i.CachePaths["/tmp/cache"] = i.CachePaths["/home/node/.npm"]
@@ -80,7 +82,8 @@ func TestBuildRejectsUnsafeInputs(t *testing.T) {
 			i.Manifest.Caches[0].Path = "cache"
 			i.CachePaths["cache"] = i.CachePaths["/home/node/.npm"]
 		},
-		"cache outside manager": func(i *Input) { i.CachePaths["/home/node/.npm"] = t.TempDir() },
+		"duplicate cache target": func(i *Input) { i.Manifest.Caches = append(i.Manifest.Caches, i.Manifest.Caches[0]) },
+		"cache outside manager":  func(i *Input) { i.CachePaths["/home/node/.npm"] = t.TempDir() },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {

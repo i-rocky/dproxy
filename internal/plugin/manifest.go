@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"dproxy/internal/fault"
 	"github.com/pelletier/go-toml/v2"
@@ -23,6 +24,12 @@ type Manifest struct {
 	Caches      []Cache             `toml:"caches"`
 	Environment map[string]string   `toml:"environment"`
 	Platforms   []Platform          `toml:"platforms"`
+	Provenance  Provenance          `toml:"-"`
+}
+
+type Provenance struct {
+	Repository, Commit, ManifestSHA256 string
+	Schema                             int
 }
 
 type Image struct {
@@ -47,7 +54,7 @@ func LoadManifest(r io.Reader) (Manifest, error) {
 	if err := decoder.Decode(&manifest); err != nil {
 		return Manifest{}, fault.New("load plugin manifest", "malformed or unknown field", ErrManifest)
 	}
-	if err := validateManifest(manifest); err != nil {
+	if err := Validate(manifest); err != nil {
 		return Manifest{}, err
 	}
 	return manifest, nil
@@ -61,7 +68,7 @@ func (m Manifest) Command(binary string) ([]string, bool) {
 	return append([]string(nil), command...), true
 }
 
-func validateManifest(m Manifest) error {
+func Validate(m Manifest) error {
 	fail := func(kind string) error { return fault.New("validate plugin manifest", kind, ErrManifest) }
 	if m.Schema != 1 || !pluginNamePattern.MatchString(m.Name) {
 		return fail("invalid identity")
@@ -88,6 +95,13 @@ func validateManifest(m Manifest) error {
 			return fail("command for undeclared binary")
 		}
 	}
+	for _, command := range m.Commands {
+		for _, element := range command {
+			if element == "" || strings.IndexFunc(element, unicode.IsControl) >= 0 {
+				return fail("invalid command element")
+			}
+		}
+	}
 	for _, image := range m.Images {
 		if !validImageRepository(image.Repository) || !validTagTemplate(image.TagTemplate) {
 			return fail("invalid image mapping")
@@ -96,10 +110,15 @@ func validateManifest(m Manifest) error {
 	if len(m.Images) == 0 {
 		return fail("missing image mapping")
 	}
+	cachePaths := make(map[string]struct{}, len(m.Caches))
 	for _, cache := range m.Caches {
 		if cache.Path == "" || !path.IsAbs(cache.Path) || path.Clean(cache.Path) != cache.Path || cache.Path == "/" {
 			return fail("invalid cache path")
 		}
+		if _, exists := cachePaths[cache.Path]; exists {
+			return fail("duplicate cache path")
+		}
+		cachePaths[cache.Path] = struct{}{}
 	}
 	for key, value := range m.Environment {
 		if key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsRune(value, '\x00') {

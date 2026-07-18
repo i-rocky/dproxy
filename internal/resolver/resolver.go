@@ -20,6 +20,9 @@ type Registry interface {
 }
 
 func Resolve(ctx context.Context, cfg config.Config, manifests map[string]plugin.Manifest, platform, configSHA256 string, registry Registry) (lock.File, error) {
+	if !lock.ValidSHA256(configSHA256) {
+		return lock.File{}, errors.New("invalid configuration digest")
+	}
 	result := lock.File{Schema: 1, ConfigSHA256: configSHA256, Tools: make(map[string]lock.Tool), Plugins: make(map[string]lock.Plugin)}
 	names := make([]string, 0, len(cfg.Tools))
 	for name := range cfg.Tools {
@@ -35,6 +38,14 @@ func Resolve(ctx context.Context, cfg config.Config, manifests map[string]plugin
 		if !supports(manifest, platform) {
 			return lock.File{}, fmt.Errorf("tool %q does not support platform", name)
 		}
+		provenance := lock.Plugin{Repository: manifest.Provenance.Repository, Commit: manifest.Provenance.Commit, ManifestSHA256: manifest.Provenance.ManifestSHA256, Schema: manifest.Provenance.Schema}
+		if err := provenance.Verify(manifest.Name); err != nil {
+			return lock.File{}, fmt.Errorf("invalid provenance for plugin %q: %w", manifest.Name, err)
+		}
+		if existing, exists := result.Plugins[manifest.Name]; exists && existing != provenance {
+			return lock.File{}, fmt.Errorf("conflicting provenance for plugin %q", manifest.Name)
+		}
+		result.Plugins[manifest.Name] = provenance
 		image, ok := manifest.Images["default"]
 		if !ok {
 			return lock.File{}, fmt.Errorf("tool %q has no default image", name)
@@ -68,6 +79,9 @@ func Resolve(ctx context.Context, cfg config.Config, manifests map[string]plugin
 			return lock.File{}, errors.New("registry returned invalid image digest")
 		}
 		result.Tools[name] = lock.Tool{Requested: requested, Version: selected.String(), Image: image.Repository, Tag: tag, Digest: digest, Platform: platform}
+	}
+	if err := result.Verify(configSHA256, platform); err != nil {
+		return lock.File{}, fmt.Errorf("resolved lock is invalid: %w", err)
 	}
 	return result, nil
 }

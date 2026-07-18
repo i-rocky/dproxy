@@ -8,10 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"unicode"
 )
 
 type Tool struct {
@@ -40,7 +44,20 @@ var (
 	digestPattern   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	versionPattern  = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
 	platformPattern = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*/[a-z0-9]+(?:[._-][a-z0-9]+)*$`)
+	commitPattern   = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+	hostPattern     = regexp.MustCompile(`^[a-z0-9]+(?:[.-][a-z0-9]+)*$`)
 )
+
+var renameFile = os.Rename
+var syncFile = func(file *os.File) error { return file.Sync() }
+var syncParent = func(parent string) error {
+	dir, err := os.Open(parent)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
 
 func HashConfig(raw []byte) string { sum := sha256.Sum256(raw); return hex.EncodeToString(sum[:]) }
 
@@ -56,9 +73,12 @@ func (f File) Verify(configSHA256, platform string) error {
 			return fmt.Errorf("locked tool %q is invalid", name)
 		}
 	}
+	if len(f.Plugins) == 0 {
+		return errors.New("lock has no plugins")
+	}
 	for name, p := range f.Plugins {
-		if name == "" || p.Repository == "" || p.Commit == "" || p.Schema != 1 || !shaPattern.MatchString(p.ManifestSHA256) {
-			return fmt.Errorf("locked plugin %q is invalid", name)
+		if err := p.Verify(name); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -119,7 +139,7 @@ func WriteAtomic(path string, f File) error {
 		_, err = io.Copy(tmp, bytes.NewReader(data))
 	}
 	if err == nil {
-		err = tmp.Sync()
+		err = syncFile(tmp)
 	}
 	closeErr := tmp.Close()
 	if err == nil {
@@ -133,22 +153,42 @@ func WriteAtomic(path string, f File) error {
 	} else if statErr != nil && !os.IsNotExist(statErr) {
 		return fmt.Errorf("inspect lock target: %w", statErr)
 	}
-	if err = os.Rename(tmpName, path); err != nil {
+	if err = renameFile(tmpName, path); err != nil {
 		return fmt.Errorf("replace lock: %w", err)
 	}
-	dir, err := os.Open(parent)
-	if err != nil {
-		return fmt.Errorf("open lock directory: %w", err)
-	}
-	defer dir.Close()
-	if err = dir.Sync(); err != nil {
+	if err = syncParent(parent); err != nil {
 		return fmt.Errorf("sync lock directory: %w", err)
 	}
 	return nil
 }
 
 func ValidDigest(value string) bool { return digestPattern.MatchString(value) }
+func ValidSHA256(value string) bool { return shaPattern.MatchString(value) }
+
+func (p Plugin) Verify(name string) error {
+	if name == "" || !canonicalHTTPSRepository(p.Repository) || !commitPattern.MatchString(p.Commit) || p.Schema != 1 || !shaPattern.MatchString(p.ManifestSHA256) {
+		return fmt.Errorf("locked plugin %q is invalid", name)
+	}
+	return nil
+}
 
 func ValidExactVersion(value string) bool {
 	return versionPattern.MatchString(strings.TrimSpace(value))
+}
+
+func canonicalHTTPSRepository(value string) bool {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path == "" || parsed.Path == "/" || pathpkg.Clean(parsed.Path) != parsed.Path || parsed.RawPath != "" || strings.ContainsRune(parsed.Path, '\\') || strings.IndexFunc(parsed.Path, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return false
+	}
+	if !hostPattern.MatchString(parsed.Hostname()) || strings.ToLower(parsed.Host) != parsed.Host || parsed.Port() == "443" {
+		return false
+	}
+	if port := parsed.Port(); port != "" {
+		n, parseErr := strconv.Atoi(port)
+		if parseErr != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+			return false
+		}
+	}
+	return parsed.String() == value
 }
