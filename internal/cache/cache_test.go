@@ -61,7 +61,7 @@ func TestCleanRecursivelyRemovesOwnedSubdirectories(t *testing.T) {
 	require.NoError(t, os.Mkdir(sub, 0700))
 	fd, err := unix.Open(sub, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	require.NoError(t, err)
-	require.NoError(t, createOwner(fd))
+	require.NoError(t, createMarker(fd))
 	require.NoError(t, unix.Close(fd))
 	require.NoError(t, os.WriteFile(filepath.Join(sub, "data"), []byte("x"), 0600))
 	require.NoError(t, m.Clean("project", "node", "npm", "24", "linux-amd64"))
@@ -118,6 +118,58 @@ func TestPruneRefusesUnownedProjectDirectory(t *testing.T) {
 func TestCacheRejectsUnsafeRoot(t *testing.T) {
 	_, err := (Manager{Root: "/"}).Path("project", "node", "npm", "24", "linux-amd64")
 	require.ErrorIs(t, err, ErrUnsafeKey)
+}
+
+func TestCacheRefusesSymlinkedAncestor(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	require.NoError(t, os.Mkdir(real, 0700))
+	link := filepath.Join(base, "link")
+	require.NoError(t, os.Symlink(real, link))
+	_, err := (Manager{Root: filepath.Join(link, "cache")}).Path("project", "node", "npm", "24", "linux-amd64")
+	require.Error(t, err)
+	require.NoDirExists(t, filepath.Join(real, "cache"))
+}
+
+func TestCacheRejectsMarkerNotBoundToDirectory(t *testing.T) {
+	m := newCache(t)
+	path, err := m.Path("project", "node", "npm", "24", "linux-amd64")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(path, ownerFile), []byte(`{"schema":1,"device":0,"inode":0}`), 0600))
+	_, err = m.Path("project", "node", "npm", "24", "linux-amd64")
+	require.ErrorIs(t, err, ErrNotOwned)
+}
+
+func TestCacheFinalSubstitutionPreservesUnmanagedReplacement(t *testing.T) {
+	m := newCache(t)
+	path, err := m.Path("project", "node", "npm", "24", "linux-amd64")
+	require.NoError(t, err)
+	beforeDelete = func(trashFD int, name string) {
+		beforeDelete = nil
+		_ = unix.Renameat(trashFD, name, trashFD, name+"-owned")
+		_ = unix.Mkdirat(trashFD, name, 0700)
+		fd, _ := openBeneath(trashFD, name)
+		if fd >= 0 {
+			survivor, _ := unix.Openat(fd, "survivor", unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC, 0600)
+			if survivor >= 0 {
+				_ = unix.Close(survivor)
+			}
+			_ = unix.Close(fd)
+		}
+	}
+	t.Cleanup(func() { beforeDelete = nil })
+	require.ErrorIs(t, m.Clean("project", "node", "npm", "24", "linux-amd64"), ErrNotOwned)
+	require.NoDirExists(t, path)
+	trash := filepath.Join(m.Root, trashName)
+	entries, err := os.ReadDir(trash)
+	require.NoError(t, err)
+	found := false
+	for _, entry := range entries {
+		if _, err := os.Stat(filepath.Join(trash, entry.Name(), "survivor")); err == nil {
+			found = true
+		}
+	}
+	require.True(t, found)
 }
 
 func TestCleanMissingCacheFailsClosed(t *testing.T) {

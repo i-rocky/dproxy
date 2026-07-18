@@ -1,11 +1,15 @@
 package shim
 
 import (
+	"bytes"
+	"crypto/rand"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func newShimManager(t *testing.T) Manager {
@@ -149,4 +153,154 @@ func TestManagerRejectsOverlappingOrRootDirectories(t *testing.T) {
 	m = newShimManager(t)
 	m.BinDir = "/"
 	require.ErrorIs(t, m.Sync(nil), ErrUnsafeName)
+}
+
+func TestSyncRefusesUnmanagedGenericCollision(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(nil))
+	require.NoError(t, os.Remove(m.recordPath(genericName)))
+	generic := filepath.Join(m.ShimDir, genericName)
+	want, err := os.ReadFile(generic)
+	require.NoError(t, err)
+	require.ErrorIs(t, m.Sync(nil), ErrCollision)
+	got, err := os.ReadFile(generic)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+}
+
+func TestRemoveFinalSubstitutionRestoresOwnedLinkAndPreservesReplacement(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	var replacement string
+	beforeRemoveVerify = func(trashFD int, name string) {
+		beforeRemoveVerify = nil
+		_ = unix.Renameat(trashFD, name, trashFD, name+"-moved")
+		_ = unix.Symlinkat("unmanaged", trashFD, name)
+		replacement = filepath.Join(m.ShimDir, ".trash", name)
+	}
+	t.Cleanup(func() { beforeRemoveVerify = nil })
+	require.ErrorIs(t, m.Remove("node"), ErrCollision)
+	owned, err := m.Owned("node")
+	require.NoError(t, err)
+	require.True(t, owned)
+	target, err := os.Readlink(replacement)
+	require.NoError(t, err)
+	require.Equal(t, "unmanaged", target)
+}
+
+func TestSyncRecordFailureRollsBackWithoutStaleOwnership(t *testing.T) {
+	m := newShimManager(t)
+	beforeRecordCommit = func(name string) error {
+		if name == "node" {
+			return errors.New("injected record failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { beforeRecordCommit = nil })
+	require.Error(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	beforeRecordCommit = nil
+	owned, err := m.Owned("node")
+	require.NoError(t, err)
+	require.False(t, owned)
+	require.NoFileExists(t, filepath.Join(m.BinDir, "node"))
+}
+
+func TestSyncFinalRecordFailureRestoresOldLinkAndMetadata(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	old, err := os.Lstat(filepath.Join(m.BinDir, "node"))
+	require.NoError(t, err)
+	beforeFinalRecord = func(name string) error {
+		if name == "node" {
+			return errors.New("injected final fsync failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { beforeFinalRecord = nil })
+	require.Error(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	beforeFinalRecord = nil
+	now, err := os.Lstat(filepath.Join(m.BinDir, "node"))
+	require.NoError(t, err)
+	require.True(t, os.SameFile(old, now))
+	owned, err := m.Owned("node")
+	require.NoError(t, err)
+	require.True(t, owned)
+}
+
+func TestSyncRecoversInterruptedPublishedUpdate(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	afterObjectPublish = func(name string) error {
+		if name == "node" {
+			return errors.New("simulated crash")
+		}
+		return nil
+	}
+	require.Error(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	afterObjectPublish = nil
+	t.Cleanup(func() { afterObjectPublish = nil })
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	owned, err := m.Owned("node")
+	require.NoError(t, err)
+	require.True(t, owned)
+}
+
+func TestSyncRecoversInterruptedTransitionBeforeCreate(t *testing.T) {
+	m := newShimManager(t)
+	afterTransition = func(name string) error {
+		if name == "node" {
+			return errInterrupted
+		}
+		return nil
+	}
+	require.Error(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	afterTransition = nil
+	t.Cleanup(func() { afterTransition = nil })
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	owned, err := m.Owned("node")
+	require.NoError(t, err)
+	require.True(t, owned)
+}
+
+func TestSyncRecoversInterruptedTransitionBeforeUpdate(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	afterTransition = func(name string) error {
+		if name == "node" {
+			return errInterrupted
+		}
+		return nil
+	}
+	require.Error(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	afterTransition = nil
+	t.Cleanup(func() { afterTransition = nil })
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	owned, err := m.Owned("node")
+	require.NoError(t, err)
+	require.True(t, owned)
+}
+
+func TestSyncNeverDeletesCollidingRandomTemp(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(nil))
+	collision := filepath.Join(m.ShimDir, ".generic-"+string(bytes.Repeat([]byte{'0'}, 32)))
+	require.NoError(t, os.WriteFile(collision, []byte("unmanaged"), 0600))
+	randomReader = bytes.NewReader(make([]byte, 64))
+	t.Cleanup(func() { randomReader = rand.Reader })
+	require.Error(t, m.Sync(nil))
+	got, err := os.ReadFile(collision)
+	require.NoError(t, err)
+	require.Equal(t, []byte("unmanaged"), got)
+}
+
+func TestShimRefusesSymlinkedManagedRootAncestor(t *testing.T) {
+	m := newShimManager(t)
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	require.NoError(t, os.Mkdir(real, 0700))
+	link := filepath.Join(base, "link")
+	require.NoError(t, os.Symlink(real, link))
+	m.ShimDir = filepath.Join(link, "shims")
+	require.Error(t, m.Sync(nil))
+	require.NoDirExists(t, filepath.Join(real, "shims"))
 }

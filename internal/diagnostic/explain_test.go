@@ -30,3 +30,14 @@ func TestExplainIsDeterministic(t *testing.T) {
 	require.Equal(t, Explain(plan), Explain(plan))
 	require.Less(t, strings.Index(Explain(plan), "A=<redacted>"), strings.Index(Explain(plan), "Z=<redacted>"))
 }
+
+func TestExplainCanonicalizesPermutedPlansAndEscapesControls(t *testing.T) {
+	left := policy.Plan{Image: "image\nforged", Environment: map[string]string{"Z": "1", "A": "2"}, Mounts: []policy.Mount{{Target: "/z"}, {Target: "/a", ReadOnly: true}}, Ports: []policy.Port{{Host: 4000, Container: 40}, {Host: 3000, Container: 30}}, Network: policy.Network{Mode: "allow\nlist", Allowlist: []string{"z.example", "a.example"}}}
+	right := left
+	right.Mounts = []policy.Mount{left.Mounts[1], left.Mounts[0]}
+	right.Ports = []policy.Port{left.Ports[1], left.Ports[0]}
+	right.Network.Allowlist = []string{"a.example", "z.example"}
+	require.Equal(t, Explain(left), Explain(right))
+	require.NotContains(t, Explain(left), "image\nforged")
+	require.Contains(t, Explain(left), `image=image\nforged`)
+}

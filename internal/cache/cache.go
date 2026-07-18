@@ -1,25 +1,37 @@
 package cache
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
 
 const ownerFile = ".dproxy-cache-owner"
+const trashName = ".dproxy-trash"
 
 var (
 	ErrUnsafeKey = errors.New("unsafe cache key")
 	ErrNotOwned  = errors.New("cache is not owned by dproxy")
 	keyPattern   = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	beforeDelete func(int, string) // test-only fault/race injection
 )
 
 type Manager struct{ Root string }
+type marker struct {
+	Schema int    `json:"schema"`
+	Device uint64 `json:"device"`
+	Inode  uint64 `json:"inode"`
+}
 
 func (m Manager) Path(projectID, pluginName, tool, compatibility, platform string) (string, error) {
 	keys, err := cacheKeys(projectID, pluginName, tool, compatibility, platform)
@@ -33,11 +45,12 @@ func (m Manager) Path(projectID, pluginName, tool, compatibility, platform strin
 	defer unix.Close(rootFD)
 	fd := rootFD
 	for _, key := range keys {
-		created := false
-		if err := unix.Mkdirat(fd, key, 0700); err == nil {
-			created = true
-		} else if err != unix.EEXIST {
-			return "", fmt.Errorf("create cache: %w", err)
+		created := unix.Mkdirat(fd, key, 0700) == nil
+		if !created {
+			var st unix.Stat_t
+			if err := unix.Fstatat(fd, key, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil || st.Mode&unix.S_IFMT != unix.S_IFDIR {
+				return "", ErrNotOwned
+			}
 		}
 		next, err := openBeneath(fd, key)
 		if err != nil {
@@ -47,15 +60,14 @@ func (m Manager) Path(projectID, pluginName, tool, compatibility, platform strin
 			unix.Close(fd)
 		}
 		fd = next
-		var ownerErr error
 		if created {
-			ownerErr = createOwner(fd)
+			err = createMarker(fd)
 		} else {
-			ownerErr = verifyOwner(fd)
+			err = verifyMarker(fd)
 		}
-		if ownerErr != nil {
+		if err != nil {
 			unix.Close(fd)
-			return "", ownerErr
+			return "", err
 		}
 	}
 	unix.Close(fd)
@@ -72,12 +84,12 @@ func (m Manager) Clean(projectID, pluginName, tool, compatibility, platform stri
 		return err
 	}
 	defer unix.Close(rootFD)
-	parentFD, err := walk(rootFD, keys[:len(keys)-1])
+	parentFD, err := walk(rootFD, keys[:4])
 	if err != nil {
 		return err
 	}
 	defer unix.Close(parentFD)
-	return removeOwnedAt(parentFD, keys[len(keys)-1])
+	return quarantineAndDelete(rootFD, parentFD, keys[4])
 }
 
 func (m Manager) Prune(keep map[string]struct{}) error {
@@ -89,22 +101,13 @@ func (m Manager) Prune(keep map[string]struct{}) error {
 		return err
 	}
 	defer unix.Close(rootFD)
-	dupFD, err := unix.Dup(rootFD)
-	if err != nil {
-		return err
-	}
-	f := os.NewFile(uintptr(dupFD), "cache root")
-	if f == nil {
-		return errors.New("duplicate cache root descriptor")
-	}
-	names, err := f.Readdirnames(-1)
-	f.Close()
+	names, err := dirNames(rootFD)
 	if err != nil {
 		return err
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if name == ownerFile {
+		if name == ownerFile || name == trashName {
 			continue
 		}
 		if _, ok := keep[name]; ok {
@@ -113,7 +116,7 @@ func (m Manager) Prune(keep map[string]struct{}) error {
 		if !keyPattern.MatchString(name) {
 			return ErrUnsafeKey
 		}
-		if err := removeOwnedAt(rootFD, name); err != nil {
+		if err := quarantineAndDelete(rootFD, rootFD, name); err != nil {
 			return err
 		}
 	}
@@ -131,106 +134,205 @@ func cacheKeys(keys ...string) ([]string, error) {
 
 func (m Manager) openRoot(create bool) (int, error) {
 	root := filepath.Clean(m.Root)
-	if m.Root == "" || !filepath.IsAbs(root) || root == string(filepath.Separator) {
+	if m.Root == "" || !filepath.IsAbs(root) || root == "/" {
 		return -1, ErrUnsafeKey
 	}
-	created := false
-	if create {
-		if err := os.Mkdir(root, 0700); err == nil {
-			created = true
-		} else if !errors.Is(err, os.ErrExist) {
-			return -1, err
-		}
-	}
-	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err == unix.ENOENT {
-		return -1, os.ErrNotExist
-	}
+	fd, created, err := openAbsoluteDir(root, create)
 	if err != nil {
+		if err == unix.ENOENT {
+			return -1, os.ErrNotExist
+		}
 		return -1, err
 	}
-	var ownerErr error
 	if created {
-		ownerErr = createOwner(fd)
+		err = createMarker(fd)
 	} else {
-		ownerErr = verifyOwner(fd)
+		err = verifyMarker(fd)
 	}
-	if ownerErr != nil {
+	if err != nil {
 		unix.Close(fd)
-		return -1, ownerErr
+		return -1, err
 	}
 	return fd, nil
+}
+
+func openAbsoluteDir(path string, createFinal bool) (int, bool, error) {
+	fd, err := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return -1, false, err
+	}
+	parts := strings.Split(strings.TrimPrefix(filepath.Clean(path), "/"), "/")
+	created := false
+	for i, part := range parts {
+		next, e := openBeneath(fd, part)
+		if e == unix.ENOENT && createFinal && i == len(parts)-1 {
+			if e = unix.Mkdirat(fd, part, 0700); e == nil {
+				created = true
+				next, e = openBeneath(fd, part)
+			}
+		}
+		unix.Close(fd)
+		if e != nil {
+			return -1, false, e
+		}
+		fd = next
+	}
+	return fd, created, nil
 }
 
 func openBeneath(dirFD int, name string) (int, error) {
 	return unix.Openat2(dirFD, name, &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS})
 }
-
 func walk(rootFD int, keys []string) (int, error) {
 	fd, err := unix.Dup(rootFD)
 	if err != nil {
 		return -1, err
 	}
 	for _, key := range keys {
-		next, err := openBeneath(fd, key)
+		next, e := openBeneath(fd, key)
 		unix.Close(fd)
-		if err != nil {
-			return -1, err
+		if e != nil {
+			return -1, e
 		}
 		fd = next
 	}
 	return fd, nil
 }
 
-func createOwner(dirFD int) error {
+func createMarker(dirFD int) error {
+	var st unix.Stat_t
+	if err := unix.Fstat(dirFD, &st); err != nil {
+		return err
+	}
+	data, _ := json.Marshal(marker{Schema: 1, Device: uint64(st.Dev), Inode: st.Ino})
+	data = append(data, '\n')
 	fd, err := unix.Openat(dirFD, ownerFile, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
 	if err != nil {
 		return err
 	}
-	if err := unix.Fsync(fd); err != nil {
-		unix.Close(fd)
-		return err
+	f := os.NewFile(uintptr(fd), "cache marker")
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
 	}
-	if err := unix.Close(fd); err != nil {
+	closeErr := f.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = unix.Unlinkat(dirFD, ownerFile, 0)
 		return err
 	}
 	return unix.Fsync(dirFD)
 }
 
-func verifyOwner(dirFD int) error {
+func verifyMarker(dirFD int) error {
 	fd, err := unix.Openat(dirFD, ownerFile, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		return ErrNotOwned
 	}
-	defer unix.Close(fd)
+	f := os.NewFile(uintptr(fd), "cache marker")
+	data, readErr := io.ReadAll(io.LimitReader(f, 257))
+	f.Close()
+	if readErr != nil || len(data) > 256 {
+		return ErrNotOwned
+	}
+	var got marker
 	var st unix.Stat_t
-	if unix.Fstat(fd, &st) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || int(st.Uid) != os.Getuid() {
+	if json.Unmarshal(data, &got) != nil || unix.Fstat(dirFD, &st) != nil || got.Schema != 1 || got.Device != uint64(st.Dev) || got.Inode != st.Ino {
 		return ErrNotOwned
 	}
 	return nil
 }
 
-func removeOwnedAt(parentFD int, name string) error {
-	fd, err := openBeneath(parentFD, name)
+func ensureTrash(rootFD int) (int, error) {
+	created := unix.Mkdirat(rootFD, trashName, 0700) == nil
+	fd, err := openBeneath(rootFD, trashName)
 	if err != nil {
-		return fmt.Errorf("securely open cache for removal: %w", err)
+		return -1, err
 	}
-	defer unix.Close(fd)
-	if err := verifyOwner(fd); err != nil {
+	if created {
+		err = createMarker(fd)
+	} else {
+		err = verifyMarker(fd)
+	}
+	if err != nil {
+		unix.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
+func randomName(prefix string) (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return prefix + hex.EncodeToString(b), nil
+}
+
+func quarantineAndDelete(rootFD, parentFD int, name string) error {
+	trashFD, err := ensureTrash(rootFD)
+	if err != nil {
 		return err
 	}
-	dupFD, err := unix.Dup(fd)
+	defer unix.Close(trashFD)
+	q, err := randomName("q-")
 	if err != nil {
 		return err
 	}
-	f := os.NewFile(uintptr(dupFD), "owned cache")
-	entries, err := f.ReadDir(-1)
-	f.Close()
+	if err := unix.Renameat2(parentFD, name, trashFD, q, unix.RENAME_NOREPLACE); err != nil {
+		return err
+	}
+	restore := func() error {
+		if err := unix.Renameat2(trashFD, q, parentFD, name, unix.RENAME_NOREPLACE); err != nil {
+			return fmt.Errorf("restore unverified cache: %w", err)
+		}
+		return unix.Fsync(parentFD)
+	}
+	fd, err := openBeneath(trashFD, q)
+	if err != nil {
+		_ = restore()
+		return ErrNotOwned
+	}
+	var owned unix.Stat_t
+	_ = unix.Fstat(fd, &owned)
+	if err := verifyMarker(fd); err != nil {
+		unix.Close(fd)
+		if restoreErr := restore(); restoreErr != nil {
+			return restoreErr
+		}
+		return err
+	}
+	if err := deleteContents(fd); err != nil {
+		unix.Close(fd)
+		return err
+	}
+	if beforeDelete != nil {
+		beforeDelete(trashFD, q)
+	}
+	var live unix.Stat_t
+	if err := unix.Fstatat(trashFD, q, &live, unix.AT_SYMLINK_NOFOLLOW); err != nil || live.Dev != owned.Dev || live.Ino != owned.Ino {
+		unix.Close(fd)
+		return ErrNotOwned
+	}
+	if err := unix.Unlinkat(fd, ownerFile, 0); err != nil {
+		unix.Close(fd)
+		return err
+	}
+	unix.Close(fd)
+	if err := unix.Unlinkat(trashFD, q, unix.AT_REMOVEDIR); err != nil {
+		return err
+	}
+	return unix.Fsync(trashFD)
+}
+
+func deleteContents(fd int) error {
+	names, err := dirNames(fd)
 	if err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		name := entry.Name()
+	for _, name := range names {
 		if name == ownerFile {
 			continue
 		}
@@ -239,18 +341,37 @@ func removeOwnedAt(parentFD int, name string) error {
 			return err
 		}
 		if st.Mode&unix.S_IFMT == unix.S_IFDIR {
-			if err := removeOwnedAt(fd, name); err != nil {
+			child, err := openBeneath(fd, name)
+			if err != nil {
+				return err
+			}
+			err = deleteContents(child)
+			if err == nil {
+				e := unix.Unlinkat(child, ownerFile, 0)
+				if e != nil && e != unix.ENOENT {
+					err = e
+				}
+			}
+			unix.Close(child)
+			if err != nil {
+				return err
+			}
+			if err := unix.Unlinkat(fd, name, unix.AT_REMOVEDIR); err != nil {
 				return err
 			}
 		} else if err := unix.Unlinkat(fd, name, 0); err != nil {
 			return err
 		}
 	}
-	if err := unix.Unlinkat(fd, ownerFile, 0); err != nil {
-		return err
-	}
-	if err := unix.Unlinkat(parentFD, name, unix.AT_REMOVEDIR); err != nil {
-		return err
-	}
 	return nil
+}
+func dirNames(fd int) ([]string, error) {
+	dup, err := unix.Dup(fd)
+	if err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(dup), "directory")
+	names, err := f.Readdirnames(-1)
+	f.Close()
+	return names, err
 }
