@@ -182,6 +182,56 @@ func (s *Store) Sync(ctx context.Context, repositoryName string) (Repository, er
 	return Repository{}, fault.New("sync plugin repository", "repository not found", ErrNotFound)
 }
 
+func (s *Store) List() []Repository {
+	result := make([]Repository, len(s.index.Repositories))
+	for i, repository := range s.index.Repositories {
+		result[i] = cloneRepository(repository)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+	return result
+}
+
+func (s *Store) Inspect(name string) (Repository, error) {
+	for _, repository := range s.index.Repositories {
+		if repository.Name == name {
+			return cloneRepository(repository), nil
+		}
+	}
+	return Repository{}, fault.New("inspect plugin repository", "repository not found", ErrNotFound)
+}
+
+func (s *Store) Remove(name string) error {
+	index := -1
+	var removed Repository
+	for i, repository := range s.index.Repositories {
+		if repository.Name == name {
+			index, removed = i, repository
+			break
+		}
+	}
+	if index < 0 {
+		return fault.New("remove plugin repository", "repository not found", ErrNotFound)
+	}
+	candidate := cloneIndex(s.index)
+	candidate.Repositories = append(candidate.Repositories[:index], candidate.Repositories[index+1:]...)
+	if err := s.persist(candidate); err != nil {
+		return err
+	}
+	s.index = candidate
+	directory := generationDirectory(s.root, removed)
+	if info, err := os.Lstat(directory); err == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fault.New("remove plugin repository", "unsafe stored generation", nil)
+		}
+		if err := os.RemoveAll(directory); err != nil {
+			return fault.New("remove plugin repository", "generation cleanup failed", err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fault.New("remove plugin repository", "generation inspection failed", err)
+	}
+	return nil
+}
+
 func (s *Store) Resolve(binary string) (Manifest, error) {
 	var result Manifest
 	found := false
@@ -542,6 +592,15 @@ func cloneIndex(index storeIndex) storeIndex {
 		}
 	}
 	return clone
+}
+
+func cloneRepository(repository Repository) Repository {
+	result := repository
+	result.ManifestHashes = make(map[string]string, len(repository.ManifestHashes))
+	for key, value := range repository.ManifestHashes {
+		result.ManifestHashes[key] = value
+	}
+	return result
 }
 
 func generationDirectory(root string, repository Repository) string {

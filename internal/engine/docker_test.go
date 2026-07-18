@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"dproxy/internal/policy"
 
@@ -39,6 +40,8 @@ type fakeDockerAPI struct {
 	networkLabels   map[string]string
 	resize          container.ResizeOptions
 	inspectErr      error
+	inspectErrs     []error
+	inspectCalls    int
 	killedSignal    string
 	execOptions     container.ExecOptions
 	execExit        int
@@ -49,6 +52,9 @@ func (f *fakeDockerAPI) ServerVersion(context.Context) (types.Version, error) { 
 func (f *fakeDockerAPI) ImagePull(context.Context, string, image.PullOptions) (io.ReadCloser, error) {
 	f.pulled = "pulled"
 	return io.NopCloser(strings.NewReader("")), nil
+}
+func (f *fakeDockerAPI) ImageInspectWithRaw(context.Context, string) (types.ImageInspect, []byte, error) {
+	return types.ImageInspect{}, nil, f.inspectErr
 }
 func (f *fakeDockerAPI) ContainerCreate(_ context.Context, c *container.Config, h *container.HostConfig, n *network.NetworkingConfig, _ *specs.Platform, _ string) (container.CreateResponse, error) {
 	f.lastConfig, f.lastHost, f.lastNet = c, h, n
@@ -82,7 +88,13 @@ func (f *fakeDockerAPI) ContainerResize(_ context.Context, _ string, o container
 	return nil
 }
 func (f *fakeDockerAPI) ContainerInspect(context.Context, string) (types.ContainerJSON, error) {
-	return types.ContainerJSON{Config: &container.Config{Labels: f.containerLabels}}, f.inspectErr
+	f.inspectCalls++
+	err := f.inspectErr
+	if len(f.inspectErrs) > 0 {
+		err = f.inspectErrs[0]
+		f.inspectErrs = f.inspectErrs[1:]
+	}
+	return types.ContainerJSON{Config: &container.Config{Labels: f.containerLabels}}, err
 }
 func (f *fakeDockerAPI) NetworkInspect(context.Context, string, network.InspectOptions) (network.Inspect, error) {
 	return network.Inspect{Labels: f.networkLabels}, f.inspectErr
@@ -189,6 +201,34 @@ func TestDockerPullNetworkAndOwnedCleanup(t *testing.T) {
 	require.NoError(t, d.RemoveContainer(context.Background(), r))
 	require.Equal(t, "container", api.removed)
 	require.Error(t, d.RemoveContainer(context.Background(), Resource{ID: "unknown"}))
+}
+
+func TestRemoveContainerWaitsForConflictingAutoRemove(t *testing.T) {
+	r := Resource{ID: "container", Ownership: Ownership{"project", "invocation"}, Role: CommandRole}
+	api := &fakeDockerAPI{
+		containerLabels: resourceLabels(r),
+		removeErr:       errdefs.Conflict(errors.New("removal already in progress")),
+		inspectErrs:     []error{nil, nil, errdefs.NotFound(errors.New("gone"))},
+	}
+	require.NoError(t, NewDocker(api).RemoveContainer(context.Background(), r))
+	require.Equal(t, 3, api.inspectCalls)
+}
+
+func TestRemoveContainerConflictingAutoRemoveTimesOut(t *testing.T) {
+	r := Resource{ID: "container", Ownership: Ownership{"project", "invocation"}, Role: CommandRole}
+	api := &fakeDockerAPI{containerLabels: resourceLabels(r), removeErr: errdefs.Conflict(errors.New("removal already in progress"))}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	err := NewDocker(api).RemoveContainer(ctx, r)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestDockerAcceptsProvisionedLocalContentAddressedImage(t *testing.T) {
+	api := &fakeDockerAPI{}
+	id := "sha256:" + strings.Repeat("a", 64)
+	require.NoError(t, NewDocker(api).PullByDigest(context.Background(), id))
+	require.Empty(t, api.pulled)
+	require.True(t, digestReference(id))
 }
 
 func TestDockerStartsOnlyGatewayWithNarrowNetworkCapability(t *testing.T) {

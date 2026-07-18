@@ -7,28 +7,50 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"dproxy/internal/policy"
+	"dproxy/internal/testimage"
 
 	"github.com/docker/docker/client"
 	"github.com/stretchr/testify/require"
 )
 
+type readinessWriter struct {
+	mu    sync.Mutex
+	seen  strings.Builder
+	ready chan struct{}
+	once  sync.Once
+}
+
+func (w *readinessWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_, _ = w.seen.Write(p)
+	if strings.Contains(w.seen.String(), "ready") {
+		w.once.Do(func() { close(w.ready) })
+	}
+	return len(p), nil
+}
+
 func integrationDocker(t *testing.T) (*Docker, policy.Plan) {
 	t.Helper()
-	image := os.Getenv("DPROXY_INTEGRATION_IMAGE")
-	if image == "" {
-		t.Fatal("DPROXY_INTEGRATION_IMAGE must name a pre-provisioned digest-pinned local image; integration qualification never skips")
-	}
-	if !digestReference(image) {
-		t.Fatal("DPROXY_INTEGRATION_IMAGE must be pinned as repository@sha256:<64 lowercase hex>")
-	}
 	api, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	require.NoError(t, err, "Docker is required for integration qualification")
 	t.Cleanup(func() { _ = api.Close() })
+	image := os.Getenv("DPROXY_INTEGRATION_IMAGE")
+	if image == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		image, err = testimage.Scratch(ctx, api, "test/fixtures/attacker", "attacker")
+		require.NoError(t, err, "offline local integration image provisioning is release-fatal")
+	}
+	if !digestReference(image) {
+		t.Fatal("integration image must be a local sha256 ID or repository digest")
+	}
 	d := NewDocker(api)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -63,15 +85,15 @@ func runIntegrationCommand(t *testing.T, d *Docker, p policy.Plan, tty bool) (in
 
 func TestDockerIntegrationCreateAttachWaitExactExit(t *testing.T) {
 	d, p := integrationDocker(t)
-	p.Command = []string{"/bin/sh", "-c", "printf dproxy-ok; exit 37"}
+	p.Command = []string{"exit-37"}
 	code, output, _ := runIntegrationCommand(t, d, p, false)
 	require.Equal(t, 37, code)
-	require.Equal(t, "dproxy-ok", output)
+	require.Empty(t, output)
 }
 
 func TestDockerIntegrationTTYResize(t *testing.T) {
 	d, p := integrationDocker(t)
-	p.Command = []string{"/bin/sh", "-c", "sleep 0.2; stty size"}
+	p.Command = []string{"terminal-size"}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	r, err := d.StartCommand(ctx, p, "", true)
@@ -95,7 +117,7 @@ func TestDockerIntegrationTTYResize(t *testing.T) {
 
 func TestDockerIntegrationSIGTERM(t *testing.T) {
 	d, p := integrationDocker(t)
-	p.Command = []string{"/bin/sh", "-c", "trap 'exit 42' TERM; while :; do sleep 1; done"}
+	p.Command = []string{"wait-term"}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	r, err := d.StartCommand(ctx, p, "", false)
@@ -105,10 +127,15 @@ func TestDockerIntegrationSIGTERM(t *testing.T) {
 		defer done()
 		_ = d.RemoveContainer(cleanupCtx, r)
 	})
-	a, err := d.Attach(ctx, r.ID, IO{Stdout: &bytes.Buffer{}, Stderr: &bytes.Buffer{}})
+	output := &readinessWriter{ready: make(chan struct{})}
+	a, err := d.Attach(ctx, r.ID, IO{Stdout: output, Stderr: output})
 	require.NoError(t, err)
 	defer a.Close()
-	time.Sleep(200 * time.Millisecond)
+	select {
+	case <-output.ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fixture did not report readiness")
+	}
 	require.NoError(t, d.Signal(ctx, r.ID, syscall.SIGTERM))
 	code, err := d.Wait(ctx, r.ID)
 	require.NoError(t, err)

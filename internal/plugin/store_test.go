@@ -351,3 +351,23 @@ func TestRepositoryURLRestrictions(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "https://example.test/plugins.git", normalized)
 }
+
+func TestStoreListInspectAndRemove(t *testing.T) {
+	root := t.TempDir()
+	s, err := NewStore(root, &fakeGit{t: t})
+	require.NoError(t, err)
+	repo := Repository{Name: "fixture", URL: "https://example.test/plugins.git", Commit: strings.Repeat("a", 40), ManifestHashes: map[string]string{"tool.toml": strings.Repeat("b", 64)}}
+	s.index.Repositories = []Repository{repo}
+	require.NoError(t, s.persist(s.index))
+
+	listed := s.List()
+	require.Equal(t, []Repository{repo}, listed)
+	listed[0].ManifestHashes["tool.toml"] = "mutated"
+	got, err := s.Inspect("fixture")
+	require.NoError(t, err)
+	require.Equal(t, strings.Repeat("b", 64), got.ManifestHashes["tool.toml"])
+	require.NoError(t, s.Remove("fixture"))
+	require.Empty(t, s.List())
+	_, err = s.Inspect("fixture")
+	require.ErrorIs(t, err, ErrNotFound)
+}

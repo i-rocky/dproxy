@@ -226,11 +226,23 @@ func writePolicy(dir, id string, p Policy) (string, error) {
 	return path, nil
 }
 func digestReference(ref string) bool {
+	if strings.HasPrefix(ref, "sha256:") && len(ref) == 71 {
+		return allHex(ref[7:])
+	}
 	parts := strings.Split(ref, "@sha256:")
 	if len(parts) != 2 || parts[0] == "" || len(parts[1]) != 64 {
 		return false
 	}
 	for _, r := range parts[1] {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			return false
+		}
+	}
+	return true
+}
+
+func allHex(value string) bool {
+	for _, r := range value {
 		if !strings.ContainsRune("0123456789abcdef", r) {
 			return false
 		}

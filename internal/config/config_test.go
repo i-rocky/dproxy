@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"dproxy/internal/fault"
@@ -87,4 +88,58 @@ NODE_ENV = "development"
 	require.Equal(t, []string{"example.com:443"}, c.Sandbox.NetworkAllowlist)
 	require.Equal(t, 3000, c.Sandbox.Ports["3000"])
 	require.Equal(t, "development", c.Sandbox.Environment["NODE_ENV"])
+}
+
+func TestAtomicConfigWriteAndToolUpdates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".dproxy.toml")
+	c := Config{Schema: 1, Tools: map[string]string{}}
+	require.NoError(t, c.SetTool("node", "24"))
+	require.NoError(t, WriteAtomic(path, c))
+	loaded, err := Load(path)
+	require.NoError(t, err)
+	require.Equal(t, "24", loaded.Tools["node"])
+	require.NoError(t, loaded.RemoveTool("node"))
+	require.Empty(t, loaded.Tools)
+}
+
+func TestUserConfigRequiresPinnedGatewayAndHTTPSRepositories(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	u := UserConfig{Schema: 1, GatewayImage: "registry.example/dproxy/gateway@sha256:" + strings.Repeat("a", 64), PluginRepositories: []string{"https://example.test/plugins.git"}}
+	require.NoError(t, WriteUserAtomic(path, u))
+	loaded, err := LoadUser(path)
+	require.NoError(t, err)
+	require.Equal(t, u, loaded)
+	u.GatewayImage = "gateway:latest"
+	require.Error(t, WriteUserAtomic(path, u))
+}
+
+func TestAtomicConfigOperationsRejectUnsafeInputs(t *testing.T) {
+	c := Config{Schema: 1, Tools: map[string]string{"node": "24"}}
+	require.Error(t, c.SetTool("../node", "24"))
+	require.Error(t, c.SetTool("node", ""))
+	require.Error(t, c.RemoveTool("missing"))
+	require.Error(t, WriteAtomic(filepath.Join(t.TempDir(), "config"), Config{Schema: 2}))
+	dir := t.TempDir()
+	target := filepath.Join(dir, "config")
+	require.NoError(t, os.Mkdir(target, 0700))
+	require.Error(t, WriteAtomic(target, c))
+	_, err := LoadUser(filepath.Join(dir, "missing"))
+	require.Error(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "bad"), []byte("unknown = 1\n"), 0600))
+	_, err = LoadUser(filepath.Join(dir, "bad"))
+	require.Error(t, err)
+}
+
+func TestUserConfigRejectsUnsafeFields(t *testing.T) {
+	base := UserConfig{Schema: 1, GatewayImage: "registry.example/dproxy/gateway@sha256:" + strings.Repeat("a", 64)}
+	for _, mutate := range []func(*UserConfig){
+		func(c *UserConfig) { c.Schema = 2 },
+		func(c *UserConfig) { c.PluginRepositories = []string{"http://example.test/plugins.git"} },
+		func(c *UserConfig) { c.PluginRepositories = []string{"https://example.test/plugins.git?token=x"} },
+		func(c *UserConfig) { c.EngineEndpoint = "bad\nendpoint" },
+	} {
+		candidate := base
+		mutate(&candidate)
+		require.Error(t, WriteUserAtomic(filepath.Join(t.TempDir(), "config"), candidate))
+	}
 }

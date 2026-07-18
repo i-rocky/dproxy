@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"dproxy/internal/policy"
 
@@ -69,6 +70,18 @@ type pullAPI interface {
 func (d *Docker) PullByDigest(ctx context.Context, ref string) error {
 	if !digestReference(ref) {
 		return errors.New("image is not pinned by digest")
+	}
+	if localImageID(ref) {
+		a, ok := d.api.(interface {
+			ImageInspectWithRaw(context.Context, string) (types.ImageInspect, []byte, error)
+		})
+		if !ok {
+			return errors.New("engine does not provide local image inspection API")
+		}
+		if _, _, err := a.ImageInspectWithRaw(ctx, ref); err != nil {
+			return fmt.Errorf("inspect provisioned local image: %w", err)
+		}
+		return nil
 	}
 	a, ok := d.api.(pullAPI)
 	if !ok {
@@ -149,8 +162,14 @@ func validatePlan(p policy.Plan, networkID string) error {
 }
 
 func digestReference(ref string) bool {
+	if localImageID(ref) {
+		return true
+	}
 	parts := strings.Split(ref, "@sha256:")
 	return len(parts) == 2 && parts[0] != "" && len(parts[1]) == 64 && allHex(parts[1])
+}
+func localImageID(ref string) bool {
+	return strings.HasPrefix(ref, "sha256:") && len(ref) == 71 && allHex(ref[7:])
 }
 func allHex(s string) bool {
 	for _, r := range s {
@@ -450,7 +469,29 @@ func (d *Docker) RemoveContainer(ctx context.Context, r Resource) error {
 	if errdefs.IsNotFound(err) {
 		return nil
 	}
+	if errdefs.IsConflict(err) {
+		return waitContainerAbsent(ctx, a, r.ID)
+	}
 	return err
+}
+
+func waitContainerAbsent(ctx context.Context, a removeAPI, id string) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		_, err := a.ContainerInspect(ctx, id)
+		if errdefs.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect container removal in progress: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 type removeNetworkAPI interface {
