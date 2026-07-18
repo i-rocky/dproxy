@@ -63,7 +63,7 @@ func (m Manifest) Command(binary string) ([]string, bool) {
 
 func validateManifest(m Manifest) error {
 	fail := func(kind string) error { return fault.New("validate plugin manifest", kind, ErrManifest) }
-	if m.Schema != 1 || m.Name == "" || path.Base(m.Name) != m.Name {
+	if m.Schema != 1 || !pluginNamePattern.MatchString(m.Name) {
 		return fail("invalid identity")
 	}
 	seen := make(map[string]struct{}, len(m.Bins))
@@ -89,7 +89,7 @@ func validateManifest(m Manifest) error {
 		}
 	}
 	for _, image := range m.Images {
-		if !validImageRepository(image.Repository) || strings.Count(image.TagTemplate, "{version}") != 1 || !tagTemplatePattern.MatchString(image.TagTemplate) {
+		if !validImageRepository(image.Repository) || !validTagTemplate(image.TagTemplate) {
 			return fail("invalid image mapping")
 		}
 	}
@@ -116,7 +116,8 @@ func validateManifest(m Manifest) error {
 
 var (
 	imageRepositoryPattern = regexp.MustCompile(`^[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[1-9][0-9]{0,4})?/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$`)
-	tagTemplatePattern     = regexp.MustCompile(`^[A-Za-z0-9_.{}-]+$`)
+	pluginNamePattern      = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*$`)
+	dockerTagPattern       = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
 )
 
 func validImageRepository(repository string) bool {
@@ -128,6 +129,18 @@ func validImageRepository(repository string) bool {
 		port := registry[colon+1:]
 		n, err := strconv.Atoi(port)
 		return err == nil && n >= 1 && n <= 65535 && strconv.Itoa(n) == port
+	}
+	return true
+}
+
+func validTagTemplate(template string) bool {
+	if strings.Count(template, "{version}") != 1 || strings.ContainsAny(strings.Replace(template, "{version}", "", 1), "{}") {
+		return false
+	}
+	for _, version := range []string{"1.2.3", strings.Repeat("9", 64)} {
+		if !dockerTagPattern.MatchString(strings.Replace(template, "{version}", version, 1)) {
+			return false
+		}
 	}
 	return true
 }

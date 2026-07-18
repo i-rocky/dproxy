@@ -43,11 +43,12 @@ type storeIndex struct {
 }
 
 type Store struct {
-	root        string
-	git         Git
-	index       storeIndex
-	renameIndex func(string, string) error
-	syncRoot    func() error
+	root                 string
+	git                  Git
+	index                storeIndex
+	renameIndex          func(string, string) error
+	syncRoot             func() error
+	syncGenerationParent func(string) error
 }
 
 func NewStore(root string, git Git) (*Store, error) {
@@ -67,6 +68,7 @@ func NewStore(root string, git Git) (*Store, error) {
 	s := &Store{root: root, git: git, index: storeIndex{Schema: 1}}
 	s.renameIndex = os.Rename
 	s.syncRoot = func() error { return syncDirectory(root) }
+	s.syncGenerationParent = syncDirectory
 	if _, ok := git.(execGit); ok {
 		s.git = execGit{executable: "/usr/bin/git", home: home}
 	}
@@ -123,14 +125,12 @@ func (s *Store) Add(ctx context.Context, repositoryURL string, trust TrustDecisi
 	if err := s.ensureNoAmbiguity(repository, stage, ""); err != nil {
 		return Repository{}, err
 	}
-	final := filepath.Join(s.root, "repos", name)
-	if err := os.Rename(stage, final); err != nil {
-		return Repository{}, fault.New("add plugin repository", "publish checkout failed", err)
+	if err := s.publishGeneration(stage, repository); err != nil {
+		return Repository{}, err
 	}
 	candidate := cloneIndex(s.index)
 	candidate.Repositories = append(candidate.Repositories, repository)
 	if err := s.persist(candidate); err != nil {
-		os.RemoveAll(final)
 		return Repository{}, err
 	}
 	s.index = candidate
@@ -160,27 +160,14 @@ func (s *Store) Sync(ctx context.Context, repositoryName string) (Repository, er
 		if err := s.ensureNoAmbiguity(updated, stage, repository.Name); err != nil {
 			return Repository{}, err
 		}
-		live := filepath.Join(s.root, "repos", repository.Name)
-		backup, err := os.MkdirTemp(s.root, ".repo-backup-")
-		if err != nil {
-			return Repository{}, fault.New("sync plugin repository", "backup failed", err)
-		}
-		os.Remove(backup)
-		if err := os.Rename(live, backup); err != nil {
-			return Repository{}, fault.New("sync plugin repository", "backup failed", err)
-		}
-		if err := os.Rename(stage, live); err != nil {
-			os.Rename(backup, live)
-			return Repository{}, fault.New("sync plugin repository", "publish checkout failed", err)
+		if err := s.publishGeneration(stage, updated); err != nil {
+			return Repository{}, err
 		}
 		candidate := cloneIndex(s.index)
 		candidate.Repositories[i] = updated
 		if err := s.persist(candidate); err != nil {
-			os.RemoveAll(live)
-			os.Rename(backup, live)
 			return Repository{}, err
 		}
-		os.RemoveAll(backup)
 		s.index = candidate
 		return updated, nil
 	}
@@ -192,7 +179,7 @@ func (s *Store) Resolve(binary string) (Manifest, error) {
 	found := false
 	for _, repository := range s.index.Repositories {
 		for manifestPath, expected := range repository.ManifestHashes {
-			raw, err := readRegularAt(filepath.Join(s.root, "repos", repository.Name), manifestPath)
+			raw, err := readRegularAt(generationDirectory(s.root, repository), manifestPath)
 			if err != nil || hash(raw) != expected {
 				return Manifest{}, fault.New("resolve plugin", "stored manifest verification failed", err)
 			}
@@ -231,7 +218,7 @@ func (s *Store) synchronize(ctx context.Context, directory string, repository Re
 	if _, err := s.run(ctx, directory, "checkout", "--detach", "--force", commit); err != nil {
 		return Repository{}, fault.New("sync plugin repository", "detached checkout failed", err)
 	}
-	tree, err := s.run(ctx, directory, "ls-tree", "-rz", "--full-tree", commit)
+	tree, err := s.run(ctx, directory, "ls-tree", "-r", "-z", "--full-tree", commit)
 	if err != nil {
 		return Repository{}, fault.New("sync plugin repository", "tree inspection failed", err)
 	}
@@ -241,6 +228,7 @@ func (s *Store) synchronize(ctx context.Context, directory string, repository Re
 	}
 	hashes := make(map[string]string, len(paths))
 	providers := make(map[string]struct{})
+	names := make(map[string]struct{})
 	for _, manifestPath := range paths {
 		raw, err := readRegularAt(directory, manifestPath)
 		if err != nil {
@@ -250,6 +238,10 @@ func (s *Store) synchronize(ctx context.Context, directory string, repository Re
 		if err != nil {
 			return Repository{}, err
 		}
+		if _, exists := names[manifest.Name]; exists {
+			return Repository{}, fault.New("sync plugin repository", "duplicate plugin name", ErrAmbiguous)
+		}
+		names[manifest.Name] = struct{}{}
 		for _, binary := range manifest.Bins {
 			if _, exists := providers[binary]; exists {
 				return Repository{}, fault.New("sync plugin repository", "duplicate binary provider", ErrAmbiguous)
@@ -265,6 +257,65 @@ func (s *Store) synchronize(ctx context.Context, directory string, repository Re
 	return repository, nil
 }
 
+func (s *Store) publishGeneration(stage string, repository Repository) error {
+	if err := fsyncTree(stage); err != nil {
+		return fault.New("publish plugin generation", "staging sync failed", err)
+	}
+	parent := filepath.Join(s.root, "repos", repository.Name)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return fault.New("publish plugin generation", "parent creation failed", err)
+	}
+	final := generationDirectory(s.root, repository)
+	if _, err := os.Lstat(final); err == nil {
+		if _, verifyErr := repositoryBinaries(final, repository.ManifestHashes); verifyErr != nil {
+			return verifyErr
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fault.New("publish plugin generation", "generation inspection failed", err)
+	} else if err := os.Rename(stage, final); err != nil {
+		return fault.New("publish plugin generation", "generation rename failed", err)
+	}
+	if err := s.syncGenerationParent(parent); err != nil {
+		return fault.New("publish plugin generation", "parent sync failed", err)
+	}
+	return nil
+}
+
+func fsyncTree(root string) error {
+	var directories []string
+	err := filepath.WalkDir(root, func(name string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			directories = append(directories, name)
+			return nil
+		}
+		if entry.Type().IsRegular() {
+			file, err := os.Open(name)
+			if err != nil {
+				return err
+			}
+			err = file.Sync()
+			closeErr := file.Close()
+			if err != nil {
+				return err
+			}
+			return closeErr
+		}
+		return errors.New("unsafe staged entry")
+	})
+	if err != nil {
+		return err
+	}
+	for i := len(directories) - 1; i >= 0; i-- {
+		if err := syncDirectory(directories[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Store) ensureNoAmbiguity(candidate Repository, candidateDirectory, replacing string) error {
 	seen, err := repositoryBinaries(candidateDirectory, candidate.ManifestHashes)
 	if err != nil {
@@ -274,35 +325,46 @@ func (s *Store) ensureNoAmbiguity(candidate Repository, candidateDirectory, repl
 		if repository.Name == replacing {
 			continue
 		}
-		binaries, err := repositoryBinaries(filepath.Join(s.root, "repos", repository.Name), repository.ManifestHashes)
+		binaries, err := repositoryBinaries(generationDirectory(s.root, repository), repository.ManifestHashes)
 		if err != nil {
 			return err
 		}
-		for binary := range binaries {
-			if _, exists := seen[binary]; exists {
+		for binary := range binaries.bins {
+			if _, exists := seen.bins[binary]; exists {
 				return fault.New("sync plugin repository", "ambiguous provider", ErrAmbiguous)
+			}
+		}
+		for name := range binaries.names {
+			if _, exists := seen.names[name]; exists {
+				return fault.New("sync plugin repository", "duplicate plugin name", ErrAmbiguous)
 			}
 		}
 	}
 	return nil
 }
 
-func repositoryBinaries(directory string, hashes map[string]string) (map[string]struct{}, error) {
-	binaries := make(map[string]struct{})
+type repositorySymbols struct {
+	bins  map[string]struct{}
+	names map[string]struct{}
+}
+
+func repositoryBinaries(directory string, hashes map[string]string) (repositorySymbols, error) {
+	symbols := repositorySymbols{bins: make(map[string]struct{}), names: make(map[string]struct{})}
 	for manifestPath, expected := range hashes {
 		raw, err := readRegularAt(directory, manifestPath)
 		if err != nil || hash(raw) != expected {
-			return nil, fault.New("validate plugin repository", "manifest verification failed", err)
+			return repositorySymbols{}, fault.New("validate plugin repository", "manifest verification failed", err)
 		}
 		manifest, err := LoadManifest(bytes.NewReader(raw))
 		if err != nil {
-			return nil, err
+			return repositorySymbols{}, err
 		}
+		symbols.names[manifest.Name] = struct{}{}
 		for _, binary := range manifest.Bins {
-			binaries[binary] = struct{}{}
+			symbols.bins[binary] = struct{}{}
 		}
 	}
-	return binaries, nil
+	return symbols, nil
 }
 
 func (s *Store) run(ctx context.Context, directory string, args ...string) ([]byte, error) {
@@ -429,6 +491,9 @@ func normalizeRepositoryURL(value string) (string, error) {
 			return "", fault.New("add plugin repository", "invalid URL", nil)
 		}
 	}
+	if port == "443" {
+		port = ""
+	}
 	parsed.Scheme = "https"
 	parsed.Host = hostname
 	if port != "" {
@@ -457,8 +522,18 @@ func validateStoredRepository(repository Repository) error {
 
 func cloneIndex(index storeIndex) storeIndex {
 	clone := storeIndex{Schema: index.Schema, Repositories: make([]Repository, len(index.Repositories))}
-	copy(clone.Repositories, index.Repositories)
+	for i, repository := range index.Repositories {
+		clone.Repositories[i] = repository
+		clone.Repositories[i].ManifestHashes = make(map[string]string, len(repository.ManifestHashes))
+		for name, digest := range repository.ManifestHashes {
+			clone.Repositories[i].ManifestHashes[name] = digest
+		}
+	}
 	return clone
+}
+
+func generationDirectory(root string, repository Repository) string {
+	return filepath.Join(root, "repos", repository.Name, repository.Commit)
 }
 
 func repositoryName(value string) string { return hash([]byte(value))[:32] }

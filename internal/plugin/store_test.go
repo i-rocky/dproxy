@@ -156,7 +156,7 @@ func TestStoreDetectsAmbiguousAndTamperedProviders(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "one", manifest.Name)
 
-	require.NoError(t, os.WriteFile(filepath.Join(s.root, "repos", first.Name, "tool.toml"), []byte("tampered"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(s.root, "repos", first.Name, first.Commit, "tool.toml"), []byte("tampered"), 0o600))
 	_, err = s.Resolve("tool")
 	require.Error(t, err)
 }
@@ -215,6 +215,9 @@ func TestStorePersistenceFailureDoesNotChangeMemoryAndAllowsRetry(t *testing.T) 
 	_, err = s.Add(context.Background(), "https://EXAMPLE.test/plugins.git", TrustDecision{Explicit: true})
 	require.Error(t, err)
 	require.Empty(t, s.index.Repositories)
+	_, err = s.Resolve("tool")
+	require.ErrorIs(t, err, ErrNotFound)
+	require.DirExists(t, filepath.Join(s.root, "repos", repositoryName("https://example.test/plugins.git"), git.commit))
 	stages, globErr := filepath.Glob(filepath.Join(s.root, ".repo-*"))
 	require.NoError(t, globErr)
 	require.Empty(t, stages)
@@ -252,6 +255,48 @@ func TestSyncPersistenceFailureRestoresLiveRepositoryAndAllowsRetry(t *testing.T
 	require.Empty(t, stages)
 }
 
+func TestGenerationParentSyncFailureLeavesIndexedRepositoryUnchanged(t *testing.T) {
+	git := &fakeGit{t: t, manifest: validManifest("old", "tool"), tree: "100644 blob abc\ttool.toml\x00", commit: strings.Repeat("3", 40)}
+	s, err := NewStore(t.TempDir(), git)
+	require.NoError(t, err)
+	repository, err := s.Add(context.Background(), "https://example.test/plugins.git", TrustDecision{Explicit: true})
+	require.NoError(t, err)
+	git.manifest = validManifest("new", "tool")
+	git.commit = strings.Repeat("4", 40)
+	realSync := s.syncGenerationParent
+	s.syncGenerationParent = func(string) error { return fmt.Errorf("injected generation parent sync failure") }
+	_, err = s.Sync(context.Background(), repository.Name)
+	require.Error(t, err)
+	require.Equal(t, strings.Repeat("3", 40), s.index.Repositories[0].Commit)
+	require.DirExists(t, filepath.Join(s.root, "repos", repository.Name, strings.Repeat("4", 40)))
+	manifest, err := s.Resolve("tool")
+	require.NoError(t, err)
+	require.Equal(t, "old", manifest.Name)
+	s.syncGenerationParent = realSync
+	updated, err := s.Sync(context.Background(), repository.Name)
+	require.NoError(t, err)
+	require.Equal(t, strings.Repeat("4", 40), updated.Commit)
+}
+
+func TestStoreRejectsDuplicateManifestNamesAcrossRepositories(t *testing.T) {
+	git := &fakeGit{t: t, manifest: validManifest("same", "one"), tree: "100644 blob abc\ttool.toml\x00", commit: strings.Repeat("5", 40)}
+	s, err := NewStore(t.TempDir(), git)
+	require.NoError(t, err)
+	_, err = s.Add(context.Background(), "https://example.test/one.git", TrustDecision{Explicit: true})
+	require.NoError(t, err)
+	git.manifest = validManifest("same", "two")
+	git.commit = strings.Repeat("6", 40)
+	_, err = s.Add(context.Background(), "https://example.test/two.git", TrustDecision{Explicit: true})
+	require.Error(t, err)
+}
+
+func TestCloneIndexDeepCopiesManifestHashes(t *testing.T) {
+	original := storeIndex{Schema: 1, Repositories: []Repository{{ManifestHashes: map[string]string{"x.toml": "old"}}}}
+	cloned := cloneIndex(original)
+	cloned.Repositories[0].ManifestHashes["x.toml"] = "new"
+	require.Equal(t, "old", original.Repositories[0].ManifestHashes["x.toml"])
+}
+
 func TestPersistRestoresIndexWhenParentSyncFails(t *testing.T) {
 	root := t.TempDir()
 	s, err := NewStore(root, &fakeGit{t: t})
@@ -280,5 +325,5 @@ func TestRepositoryURLRestrictions(t *testing.T) {
 	}
 	normalized, err := normalizeRepositoryURL("HTTPS://EXAMPLE.TEST:443/plugins.git")
 	require.NoError(t, err)
-	require.Equal(t, "https://example.test:443/plugins.git", normalized)
+	require.Equal(t, "https://example.test/plugins.git", normalized)
 }
