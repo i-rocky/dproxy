@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"net/netip"
 	"time"
@@ -179,5 +178,3 @@ func andBytes(a, b []byte) []byte {
 	}
 	return r
 }
-
-var _ = binary.BigEndian

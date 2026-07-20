@@ -228,7 +228,7 @@ Commands:
   tool        add or remove tools
   plugin      add, remove, sync, list, or inspect plugins
   setup       install this project's tool shims from its lockfile
-  doctor      verify configuration, project, and Docker engine
+  doctor      verify configuration and Docker engine; provision the gateway
   cache       list, clean, or prune the shared cache
   uninstall   remove global shims and shell integration
   version     print the dproxy version
