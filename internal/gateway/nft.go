@@ -112,19 +112,22 @@ func addPrefixRule(c nftConn, t *nftables.Table, ch *nftables.Chain, s RuleSpec,
 }
 func addLookupRule(c nftConn, t *nftables.Table, ch *nftables.Chain, set *nftables.Set, v int) {
 	offset := uint32(24)
-	l := uint32(16)
+	ipLen := uint32(16)
 	family := byte(unix.NFPROTO_IPV6)
 	if v == 4 {
 		offset = 16
-		l = 4
+		ipLen = 4
 		family = unix.NFPROTO_IPV4
 	}
-	portRegister := uint32(5)
-	if v == 4 {
-		portRegister = 2
-	}
+	// Keep the concatenated (address, port) key entirely within the 32-bit
+	// register file so the kernel can read it contiguously: IPv4 address (4B)
+	// in register 8 with the port in register 9; IPv6 address (16B) in
+	// registers 8..11 with the port in register 12. Splitting the key across
+	// the legacy NFT_REG_1 (16-byte) area and the 32-bit area is rejected.
+	const ipReg = 8
+	portReg := ipReg + ipLen/4
 	for _, proto := range []byte{unix.IPPROTO_TCP, unix.IPPROTO_UDP} {
-		c.AddRule(&nftables.Rule{Table: t, Chain: ch, Exprs: []expr.Any{&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{family}}, &expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}}, &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: l}, &expr.Payload{DestRegister: portRegister, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2}, &expr.Lookup{SourceRegister: 1, SetName: set.Name, SetID: set.ID}, &expr.Verdict{Kind: expr.VerdictAccept}}})
+		c.AddRule(&nftables.Rule{Table: t, Chain: ch, Exprs: []expr.Any{&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{family}}, &expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}}, &expr.Payload{DestRegister: ipReg, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: ipLen}, &expr.Payload{DestRegister: portReg, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2}, &expr.Lookup{SourceRegister: ipReg, SetName: set.Name, SetID: set.ID}, &expr.Verdict{Kind: expr.VerdictAccept}}})
 	}
 }
 func (n *NFT) Pin(_ context.Context, pins []PinnedEndpoint, ttl time.Duration) error {
