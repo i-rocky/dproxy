@@ -3,12 +3,14 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/i-rocky/dproxy/internal/plugin"
 	"github.com/i-rocky/dproxy/internal/shim"
 	"github.com/stretchr/testify/require"
 )
@@ -19,6 +21,9 @@ func TestInstallIsAdminCommand(t *testing.T) {
 
 func TestInstallWiresShimsCompletionsAndRc(t *testing.T) {
 	systemEnvironment(t)
+	oldLoad := officialLoad
+	t.Cleanup(func() { officialLoad = oldLoad })
+	officialLoad = func() (map[string]plugin.Manifest, error) { return map[string]plugin.Manifest{"node": {}}, nil }
 	home := os.Getenv("HOME")
 	dataHome := os.Getenv("XDG_DATA_HOME")
 	binDir := filepath.Join(home, ".local", "bin")
@@ -48,6 +53,26 @@ func TestInstallWiresShimsCompletionsAndRc(t *testing.T) {
 	rc2, err := os.ReadFile(filepath.Join(home, ".bashrc"))
 	require.NoError(t, err)
 	require.Equal(t, 1, strings.Count(string(rc2), dproxyBlockBegin))
+}
+
+// TestInstallSkipsShimsWhenPluginsDoNotLoad locks the "shim only for loadable
+// plugins" rule: when the bundled plugins cannot load (e.g. a build with no
+// derivable provenance), install wires the shell but creates no tool shims, so
+// it never installs a shim that would route to "plugin not found".
+func TestInstallSkipsShimsWhenPluginsDoNotLoad(t *testing.T) {
+	systemEnvironment(t)
+	oldLoad := officialLoad
+	t.Cleanup(func() { officialLoad = oldLoad })
+	officialLoad = func() (map[string]plugin.Manifest, error) { return nil, errors.New("no provenance") }
+	home := os.Getenv("HOME")
+	binDir := filepath.Join(home, ".local", "bin")
+	var out bytes.Buffer
+	require.NoError(t, (systemRunner{}).Command(context.Background(), "install", []string{"--shell", "bash"}, Streams{Stdout: &out, Stderr: &out}))
+	require.Contains(t, out.String(), "no loadable official plugins")
+	for _, tool := range []string{"node", "npm", "python"} {
+		_, err := os.Lstat(filepath.Join(binDir, tool))
+		require.ErrorIs(t, err, os.ErrNotExist, tool)
+	}
 }
 
 func TestInstallRcBlockReplacementPreservesOtherContent(t *testing.T) {

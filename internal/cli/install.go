@@ -66,6 +66,9 @@ func installCommand(args []string, streams Streams) error {
 		return err
 	}
 	fmt.Fprintf(streams.Stdout, "installed %d managed tool shims\n", len(keep))
+	if len(keep) == 0 && len(skipped) == 0 {
+		fmt.Fprintln(streams.Stdout, "no loadable official plugins to shim; run 'dproxy doctor' to diagnose")
+	}
 	if len(skipped) > 0 {
 		fmt.Fprintf(streams.Stdout, "skipped %d tools already on PATH (not overridden): %s\n", len(skipped), strings.Join(skipped, ", "))
 	}
@@ -139,10 +142,14 @@ func knownShell(name string) bool {
 	}
 }
 
-// officialTargets builds shim targets for every binary provided by the bundled
-// official manifests. It does not require release provenance: shims only point
-// at the dproxy binary; provenance is enforced when a tool is actually resolved.
+// officialTargets builds shim targets for the bundled official manifests, but
+// only when those plugins actually load (officialLoad succeeds — which requires
+// derivable provenance). A shim for a tool whose plugin cannot load would route
+// to "plugin not found", so none are installed in that case.
 func officialTargets() (map[string]shim.Target, error) {
+	if _, err := officialLoad(); err != nil {
+		return map[string]shim.Target{}, nil
+	}
 	bins, err := official.Binaries()
 	if err != nil {
 		return nil, fmt.Errorf("enumerate official tools: %w", err)
