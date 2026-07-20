@@ -13,10 +13,9 @@ import (
 )
 
 type UserConfig struct {
-	Schema             int      `toml:"schema"`
-	EngineEndpoint     string   `toml:"engine_endpoint,omitempty"`
-	GatewayImage       string   `toml:"gateway_image"`
-	PluginRepositories []string `toml:"plugin_repositories,omitempty"`
+	Schema         int    `toml:"schema"`
+	EngineEndpoint string `toml:"engine_endpoint,omitempty"`
+	GatewayImage   string `toml:"gateway_image"`
 }
 
 // gatewayPattern accepts either a registry digest reference
@@ -93,11 +92,6 @@ func WriteUserAtomic(path string, c UserConfig) error {
 func validateUser(c UserConfig) error {
 	if c.Schema != 1 || !gatewayPattern.MatchString(c.GatewayImage) {
 		return errors.New("user configuration requires a digest-pinned gateway image")
-	}
-	for _, repository := range c.PluginRepositories {
-		if !strings.HasPrefix(repository, "https://") || strings.ContainsAny(repository, "?#@") {
-			return errors.New("plugin repository must use canonical HTTPS")
-		}
 	}
 	if strings.ContainsAny(c.EngineEndpoint, "\r\n\x00") {
 		return errors.New("invalid engine endpoint")

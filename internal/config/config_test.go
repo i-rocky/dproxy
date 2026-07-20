@@ -104,7 +104,7 @@ func TestAtomicConfigWriteAndToolUpdates(t *testing.T) {
 
 func TestUserConfigRequiresPinnedGatewayAndHTTPSRepositories(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
-	u := UserConfig{Schema: 1, GatewayImage: "registry.example/dproxy/gateway@sha256:" + strings.Repeat("a", 64), PluginRepositories: []string{"https://example.test/plugins.git"}}
+	u := UserConfig{Schema: 1, GatewayImage: "registry.example/dproxy/gateway@sha256:" + strings.Repeat("a", 64)}
 	require.NoError(t, WriteUserAtomic(path, u))
 	loaded, err := LoadUser(path)
 	require.NoError(t, err)
@@ -134,8 +134,6 @@ func TestUserConfigRejectsUnsafeFields(t *testing.T) {
 	base := UserConfig{Schema: 1, GatewayImage: "registry.example/dproxy/gateway@sha256:" + strings.Repeat("a", 64)}
 	for _, mutate := range []func(*UserConfig){
 		func(c *UserConfig) { c.Schema = 2 },
-		func(c *UserConfig) { c.PluginRepositories = []string{"http://example.test/plugins.git"} },
-		func(c *UserConfig) { c.PluginRepositories = []string{"https://example.test/plugins.git?token=x"} },
 		func(c *UserConfig) { c.EngineEndpoint = "bad\nendpoint" },
 	} {
 		candidate := base

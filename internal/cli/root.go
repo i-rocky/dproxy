@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 
 	"github.com/i-rocky/dproxy/internal/diagnostic"
@@ -105,7 +106,7 @@ parsed:
 		if len(args) != 1 || dryRun || explain {
 			return usage(streams, "version takes no arguments")
 		}
-		fmt.Fprintln(streams.Stdout, "dproxy dev")
+		fmt.Fprintf(streams.Stdout, "dproxy %s\n", buildVersion())
 		return 0
 	}
 	if isAdmin(args[0]) {
@@ -194,6 +195,18 @@ func reportError(s Streams, err error) int {
 }
 
 func usage(s Streams, message string) int { fmt.Fprintln(s.Stderr, message); return 2 }
+
+// buildVersion reports the dproxy version. A `go install ...@version` build
+// carries the module version (pseudo-version or tag) in its build info; a local
+// `go build` reports "(devel)", which falls back to "dev". No ldflags required.
+func buildVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if v := info.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return "dev"
+}
 
 func isAdmin(name string) bool {
 	switch name {
