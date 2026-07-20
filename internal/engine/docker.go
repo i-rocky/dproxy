@@ -261,7 +261,7 @@ func (d *Docker) StartGateway(ctx context.Context, s GatewaySpec) (Resource, err
 		return Resource{}, errors.New("engine does not provide gateway create API")
 	}
 	labels := map[string]string{ManagedLabel: "true", ProjectLabel: s.Ownership.ProjectID, InvocationLabel: s.Ownership.InvocationID, RoleLabel: GatewayRole}
-	cfg := &container.Config{Image: s.Image, Cmd: []string{"/gateway", "serve", "--policy", "/etc/dproxy/policy.json"}, Env: []string{"DPROXY_HEALTH_TOKEN=" + s.HealthToken, "DPROXY_DNS_UPSTREAM=" + upstream}, Labels: labels}
+	cfg := &container.Config{Image: s.Image, Cmd: []string{"serve", "--policy", "/etc/dproxy/policy.json"}, Env: []string{"DPROXY_HEALTH_TOKEN=" + s.HealthToken, "DPROXY_DNS_UPSTREAM=" + upstream}, Labels: labels}
 	host := &container.HostConfig{NetworkMode: container.NetworkMode(s.InternalNetworkID), AutoRemove: true, ReadonlyRootfs: true, CapDrop: []string{"ALL"}, CapAdd: []string{"NET_ADMIN"}, SecurityOpt: []string{"no-new-privileges"}, Sysctls: map[string]string{"net.ipv4.ip_forward": "1", "net.ipv6.conf.all.forwarding": "1"}, Mounts: []mount.Mount{{Type: mount.TypeBind, Source: filepath.Clean(s.PolicyPath), Target: "/etc/dproxy/policy.json", ReadOnly: true}}, Tmpfs: map[string]string{"/run": "rw,nosuid,nodev,noexec,mode=0700"}}
 	ports := make(nat.PortSet)
 	bindings := make(nat.PortMap)

@@ -208,7 +208,11 @@ func writePolicy(dir, id string, p Policy) (string, error) {
 		return "", fmt.Errorf("encode gateway policy: %w", err)
 	}
 	path := filepath.Join(dir, "gateway-policy-"+id+".json")
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0400)
+	// 0444 (not 0400): the gateway runs with cap-drop ALL and therefore lacks
+	// CAP_DAC_OVERRIDE, so it cannot read an owner-only file owned by the host
+	// user. World-readable + no write bits + a read-only bind mount keep the
+	// policy tamper-proof while letting the gateway read it.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0444)
 	if err != nil {
 		return "", fmt.Errorf("create gateway policy: %w", err)
 	}
