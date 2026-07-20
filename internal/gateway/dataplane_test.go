@@ -92,10 +92,13 @@ func TestDNSPinsAuthorizedAnswersWithBoundedTTL(t *testing.T) {
 	proxy := &DNSProxy{Policy: p, Upstream: "dns:53", Exchange: fakeExchange{m}, Pinner: pin, MaxTTL: 2 * time.Minute}
 	q := new(dns.Msg)
 	q.SetQuestion("example.com.", dns.TypeA)
-	_, err = proxy.resolve(context.Background(), q)
+	resp, err := proxy.resolve(context.Background(), q)
 	require.NoError(t, err)
 	require.Equal(t, 2*time.Minute, pin.ttl)
 	require.Equal(t, []PinnedEndpoint{{Addr: netip.MustParseAddr("93.184.216.34"), Port: 443}}, pin.pins)
+	// The returned answer TTL is clamped to the pin lifetime so a caching client
+	// cannot outlive the pinned endpoint.
+	require.Equal(t, uint32(120), resp.Answer[0].(*dns.A).Hdr.Ttl, "answer TTL must be clamped to the pin lifetime")
 }
 func TestDNSPinsOnlyAssociatedPortsForSharedIP(t *testing.T) {
 	p, err := networkpolicy.Allowlist([]string{"a.example:443", "b.example:80"})

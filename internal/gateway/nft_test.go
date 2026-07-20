@@ -99,3 +99,26 @@ func TestPrefixExpressionHelpers(t *testing.T) {
 	require.Equal(t, []byte{255, 255, 240, 0}, prefixMask(20, 4))
 	require.Equal(t, []byte{0xa0}, andBytes([]byte{0xab}, []byte{0xf0}))
 }
+
+func TestNFTInstallDropsInboundExceptEstablishedAndLoopback(t *testing.T) {
+	p, err := networkpolicy.Allowlist([]string{"example.com:443"})
+	require.NoError(t, err)
+	c := &fakeNFTConn{}
+	require.NoError(t, (&NFT{Conn: c, Policy: p, DNSPort: 1053}).Install())
+	var input *nftables.Chain
+	for _, ch := range c.chains {
+		if ch.Name == "input" {
+			input = ch
+		}
+	}
+	require.NotNil(t, input, "an input chain must harden the gateway")
+	require.NotNil(t, input.Policy)
+	require.Equal(t, nftables.ChainPolicyDrop, *input.Policy, "inbound is default-deny")
+	var rules int
+	for _, r := range c.rules {
+		if r.Chain != nil && r.Chain.Name == "input" {
+			rules++
+		}
+	}
+	require.Greater(t, rules, 0, "input must accept established/related and loopback before the drop")
+}

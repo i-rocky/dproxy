@@ -168,5 +168,19 @@ func (p *DNSProxy) resolve(ctx context.Context, q *dns.Msg) (*dns.Msg, error) {
 			return nil, fmt.Errorf("pin DNS answers: %w", err)
 		}
 	}
+	// Clamp the returned answers to the pin lifetime so a client that caches the
+	// resolution does not outlive the pinned endpoint and dial fail-closed when
+	// the pin expires.
+	if len(addrs) > 0 {
+		clamp := uint32(ttl / time.Second)
+		for _, rr := range resp.Answer {
+			switch v := rr.(type) {
+			case *dns.A:
+				v.Hdr.Ttl = clamp
+			case *dns.AAAA:
+				v.Hdr.Ttl = clamp
+			}
+		}
+	}
 	return resp, nil
 }
