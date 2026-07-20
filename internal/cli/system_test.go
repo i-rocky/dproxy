@@ -300,9 +300,12 @@ func TestDoctorUsesInjectedEngineVerification(t *testing.T) {
 	old := systemDoctorVerify
 	t.Cleanup(func() { systemDoctorVerify = old })
 	systemDoctorVerify = func(context.Context, config.UserConfig) error { return nil }
+	oldLoad := officialLoad
+	t.Cleanup(func() { officialLoad = oldLoad })
+	officialLoad = func() (map[string]plugin.Manifest, error) { return map[string]plugin.Manifest{"node": {}}, nil }
 	var out bytes.Buffer
 	require.NoError(t, (systemRunner{}).Command(context.Background(), "doctor", nil, Streams{Stdout: &out}))
-	require.Contains(t, out.String(), "healthy")
+	require.Contains(t, out.String(), "all checks passed")
 	systemDoctorVerify = func(context.Context, config.UserConfig) error { return errors.New("offline") }
 	require.Error(t, doctorCommand(context.Background(), Streams{Stdout: &out}))
 }

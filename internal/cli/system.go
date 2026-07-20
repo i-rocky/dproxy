@@ -24,6 +24,7 @@ import (
 	"github.com/i-rocky/dproxy/internal/resolver"
 	commandruntime "github.com/i-rocky/dproxy/internal/runtime"
 	"github.com/i-rocky/dproxy/internal/shim"
+	"github.com/i-rocky/dproxy/internal/testimage"
 	"github.com/i-rocky/dproxy/plugins/official"
 
 	dockerclient "github.com/docker/docker/client"
@@ -390,23 +391,92 @@ func setupCommand(streams Streams) error {
 	return nil
 }
 
+// defaultGatewayImage is the published deny-first gateway dproxy doctor pulls
+// and pins when provisioning a user configuration. Tagged :latest; doctor
+// resolves it to a platform-specific digest so the pin is immutable.
+const defaultGatewayImage = "ghcr.io/i-rocky/dproxy-gateway:latest"
+
+// officialLoad is the bundled-plugin loader; a variable so doctor's plugin
+// check can be injected in tests (the test binary carries no provenance).
+var officialLoad = official.Load
+
 func doctorCommand(ctx context.Context, streams Streams) error {
-	user, _, _, _, err := loadUserState()
-	if err != nil {
-		return err
+	w := streams.Stdout
+	fmt.Fprintln(w, "dproxy doctor")
+	configDir, derr := os.UserConfigDir()
+	if derr != nil {
+		return fmt.Errorf("locate user config directory: %w", derr)
 	}
-	p, err := project.Find(".")
-	if err != nil {
-		return err
-	}
-	if _, err = config.Load(filepath.Join(p.Root, ".dproxy.toml")); err != nil {
-		return err
-	}
+	configPath := filepath.Join(configDir, "dproxy", "config.toml")
+	user, loadErr := config.LoadUser(configPath)
+	healthy := true
+	// Engine check (injectable for tests). Uses the loaded engine endpoint, if any.
 	if err := systemDoctorVerify(ctx, user); err != nil {
-		return err
+		fmt.Fprintf(w, "  docker engine: FAIL (%v)\n", err)
+		return fmt.Errorf("docker engine: %w", err)
 	}
-	fmt.Fprintln(streams.Stdout, "configuration, project, and Docker engine are healthy")
-	return nil
+	fmt.Fprintln(w, "  docker engine: OK")
+
+	switch {
+	case loadErr == nil:
+		fmt.Fprintf(w, "  user configuration: OK (gateway %s)\n", user.GatewayImage)
+	case errors.Is(loadErr, os.ErrNotExist):
+		fmt.Fprintln(w, "  user configuration: MISSING — provisioning a gateway image")
+		ref, ensureErr := ensureGatewayImage(ctx)
+		if ensureErr != nil {
+			fmt.Fprintf(w, "  gateway image: FAIL (%v)\n", ensureErr)
+			return fmt.Errorf("provision gateway image: %w", ensureErr)
+		}
+		if werr := config.WriteUserAtomic(configPath, config.UserConfig{Schema: 1, GatewayImage: ref}); werr != nil {
+			fmt.Fprintf(w, "  user configuration: FAIL (write: %v)\n", werr)
+			return fmt.Errorf("write user configuration: %w", werr)
+		}
+		fmt.Fprintf(w, "  user configuration: FIXED (wrote %s, gateway %s)\n", configPath, ref)
+	default:
+		fmt.Fprintf(w, "  user configuration: FAIL (invalid: %v)\n", loadErr)
+		healthy = false
+	}
+	if manifests, lerr := officialLoad(); lerr == nil {
+		fmt.Fprintf(w, "  official plugins: OK (%d loadable)\n", len(manifests))
+	} else {
+		fmt.Fprintf(w, "  official plugins: FAIL (%v)\n", lerr)
+		healthy = false
+	}
+	if _, _, dataRoot, rerr := userRoots(); rerr == nil {
+		if store, serr := plugin.OpenStore(filepath.Join(dataRoot, "plugins"), nil); serr == nil {
+			if repos := store.List(); len(repos) > 0 {
+				fmt.Fprintf(w, "  trusted plugin repositories: %d\n", len(repos))
+			}
+		}
+	}
+	fmt.Fprintln(w, "  shims: run 'dproxy install' to (re)create managed tool shims")
+	if healthy {
+		fmt.Fprintln(w, "all checks passed")
+		return nil
+	}
+	return errors.New("one or more checks failed; see above")
+}
+
+// ensureGatewayImage provisions a digest-pinned gateway image: it resolves the
+// published gateway's platform digest and pulls it, falling back to building
+// from source (only possible in a source checkout). Returns a reference usable
+// as UserConfig.GatewayImage.
+func ensureGatewayImage(ctx context.Context) (string, error) {
+	api, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
+	if err != nil {
+		return "", err
+	}
+	platform := runtime.GOOS + "/" + runtime.GOARCH
+	if digest, err := registry.New(nil).Digest(ctx, defaultGatewayImage, platform); err == nil {
+		ref := "ghcr.io/i-rocky/dproxy-gateway@" + digest
+		if err := engine.NewDocker(api).PullByDigest(ctx, ref); err == nil {
+			return ref, nil
+		}
+	}
+	if id, err := testimage.Scratch(ctx, api, "cmd/gateway", "gateway"); err == nil {
+		return id, nil
+	}
+	return "", errors.New("published gateway image unavailable and source build failed (offline, or no source checkout)")
 }
 
 var systemDoctorVerify = func(ctx context.Context, user config.UserConfig) error {
