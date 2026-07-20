@@ -1,0 +1,54 @@
+name: release
+
+# Cut a release on a version tag. Builds the dproxy host binary for the
+# supported Linux platforms (the OS guard fails closed on macOS/Windows until
+# those backends land), publishes SHA-256 checksums, an SPDX SBOM, and
+# keyless sigstore signatures. The gateway image is published separately and
+# continuously by gateway.yml (doctor pins it by digest).
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+  id-token: write # for cosign keyless signing
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: build host binary (linux/amd64, linux/arm64)
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+              -o dist/dproxy-linux-$arch ./cmd/dproxy
+          done
+      - name: checksums
+        run: cd dist && sha256sum dproxy-linux-* > checksums-sha256.txt
+      - name: SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/sbom.spdx.json
+      - uses: sigstore/cosign-installer@v3
+      - name: sign artifacts (keyless sigstore)
+        run: |
+          cd dist
+          for f in dproxy-linux-amd64 dproxy-linux-arm64 checksums-sha256.txt; do
+            cosign sign-blob --yes "$f" --output-signature "$f.sig" --output-certificate "$f.pem"
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/dproxy-linux-*
+            dist/checksums-sha256.txt
+            dist/sbom.spdx.json
