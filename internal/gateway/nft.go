@@ -7,10 +7,10 @@ import (
 	"net/netip"
 	"time"
 
-	networkpolicy "dproxy/internal/network"
 	"github.com/google/nftables"
 	"github.com/google/nftables/binaryutil"
 	"github.com/google/nftables/expr"
+	networkpolicy "github.com/i-rocky/dproxy/internal/network"
 	"golang.org/x/sys/unix"
 )
 

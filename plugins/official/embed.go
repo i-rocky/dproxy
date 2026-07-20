@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"dproxy/internal/plugin"
+	"github.com/i-rocky/dproxy/internal/plugin"
 )
 
 // Set by release ldflags. Development builds intentionally have no synthetic

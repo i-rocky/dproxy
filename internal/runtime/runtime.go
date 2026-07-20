@@ -10,9 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"dproxy/internal/engine"
-	networkpolicy "dproxy/internal/network"
-	"dproxy/internal/policy"
+	"github.com/i-rocky/dproxy/internal/engine"
+	networkpolicy "github.com/i-rocky/dproxy/internal/network"
+	"github.com/i-rocky/dproxy/internal/policy"
 )
 
 const defaultCleanupTimeout = 10 * time.Second

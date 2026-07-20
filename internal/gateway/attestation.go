@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	networkpolicy "dproxy/internal/network"
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
+	networkpolicy "github.com/i-rocky/dproxy/internal/network"
 )
 
 type NFTQuery interface {

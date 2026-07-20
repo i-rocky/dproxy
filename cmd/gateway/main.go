@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"dproxy/internal/gateway"
+	"github.com/i-rocky/dproxy/internal/gateway"
 )
 
 const readyPath = "/run/dproxy-ready"

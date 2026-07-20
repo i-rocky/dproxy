@@ -30,11 +30,8 @@ all-OS from day one — see the
 
 ## Install
 
-Build from source, then install the shims:
-
 ```sh
-git clone <this repo> && cd dproxy
-go build -o ~/.local/bin/dproxy ./cmd/dproxy
+go install github.com/i-rocky/dproxy/cmd/dproxy@latest
 dproxy install
 ```
 

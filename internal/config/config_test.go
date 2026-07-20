@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"dproxy/internal/fault"
+	"github.com/i-rocky/dproxy/internal/fault"
 	"github.com/stretchr/testify/require"
 )
 

@@ -4,8 +4,8 @@ package integration
 
 import (
 	"context"
-	"dproxy/internal/engine"
 	"fmt"
+	"github.com/i-rocky/dproxy/internal/engine"
 	"github.com/stretchr/testify/require"
 	"testing"
 	"time"

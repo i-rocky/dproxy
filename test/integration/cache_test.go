@@ -3,7 +3,7 @@
 package integration
 
 import (
-	"dproxy/internal/cache"
+	"github.com/i-rocky/dproxy/internal/cache"
 	"github.com/stretchr/testify/require"
 	"os"
 	"path/filepath"

@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"strings"
 
-	networkpolicy "dproxy/internal/network"
+	networkpolicy "github.com/i-rocky/dproxy/internal/network"
 )
 
 type Resolver interface {

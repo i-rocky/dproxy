@@ -13,11 +13,11 @@ import (
 	"strings"
 	"testing"
 
-	"dproxy/internal/cli"
-	"dproxy/internal/config"
-	"dproxy/internal/lock"
-	"dproxy/internal/project"
-	"dproxy/plugins/official"
+	"github.com/i-rocky/dproxy/internal/cli"
+	"github.com/i-rocky/dproxy/internal/config"
+	"github.com/i-rocky/dproxy/internal/lock"
+	"github.com/i-rocky/dproxy/internal/project"
+	"github.com/i-rocky/dproxy/plugins/official"
 
 	"github.com/stretchr/testify/require"
 )

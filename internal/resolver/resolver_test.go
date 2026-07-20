@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"dproxy/internal/config"
-	"dproxy/internal/plugin"
+	"github.com/i-rocky/dproxy/internal/config"
+	"github.com/i-rocky/dproxy/internal/plugin"
 	"github.com/stretchr/testify/require"
 )
 

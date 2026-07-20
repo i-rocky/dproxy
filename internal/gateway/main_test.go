@@ -3,10 +3,10 @@ package gateway
 import (
 	"context"
 	"crypto/sha256"
-	networkpolicy "dproxy/internal/network"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	networkpolicy "github.com/i-rocky/dproxy/internal/network"
 	"os"
 	"path/filepath"
 	"testing"

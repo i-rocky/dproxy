@@ -4,7 +4,7 @@ import (
 	"context"
 	"os"
 
-	"dproxy/internal/cli"
+	"github.com/i-rocky/dproxy/internal/cli"
 )
 
 func main() {

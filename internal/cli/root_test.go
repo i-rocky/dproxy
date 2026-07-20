@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	"dproxy/internal/policy"
-	commandruntime "dproxy/internal/runtime"
+	"github.com/i-rocky/dproxy/internal/policy"
+	commandruntime "github.com/i-rocky/dproxy/internal/runtime"
 	"github.com/stretchr/testify/require"
 )
 

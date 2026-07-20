@@ -8,10 +8,10 @@ import (
 	"strconv"
 	"strings"
 
-	"dproxy/internal/config"
-	"dproxy/internal/lock"
-	"dproxy/internal/plugin"
 	"github.com/Masterminds/semver/v3"
+	"github.com/i-rocky/dproxy/internal/config"
+	"github.com/i-rocky/dproxy/internal/lock"
+	"github.com/i-rocky/dproxy/internal/plugin"
 )
 
 type Registry interface {

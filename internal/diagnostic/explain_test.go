@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"dproxy/internal/policy"
+	"github.com/i-rocky/dproxy/internal/policy"
 	"github.com/stretchr/testify/require"
 )
 

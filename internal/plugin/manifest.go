@@ -10,7 +10,7 @@ import (
 	"strings"
 	"unicode"
 
-	"dproxy/internal/fault"
+	"github.com/i-rocky/dproxy/internal/fault"
 	"github.com/pelletier/go-toml/v2"
 )
 

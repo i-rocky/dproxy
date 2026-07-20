@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	networkpolicy "dproxy/internal/network"
 	"github.com/google/nftables"
+	networkpolicy "github.com/i-rocky/dproxy/internal/network"
 	"github.com/miekg/dns"
 )
 

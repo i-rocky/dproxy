@@ -7,7 +7,7 @@ import (
 	"net/netip"
 	"testing"
 
-	networkpolicy "dproxy/internal/network"
+	networkpolicy "github.com/i-rocky/dproxy/internal/network"
 	"github.com/stretchr/testify/require"
 )
 

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	networkpolicy "dproxy/internal/network"
+	networkpolicy "github.com/i-rocky/dproxy/internal/network"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
 )

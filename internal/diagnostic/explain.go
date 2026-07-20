@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"dproxy/internal/policy"
+	"github.com/i-rocky/dproxy/internal/policy"
 )
 
 func Explain(plan policy.Plan) string {

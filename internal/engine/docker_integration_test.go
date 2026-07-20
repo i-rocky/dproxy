@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"dproxy/internal/policy"
-	"dproxy/internal/testimage"
+	"github.com/i-rocky/dproxy/internal/policy"
+	"github.com/i-rocky/dproxy/internal/testimage"
 
 	"github.com/docker/docker/client"
 	"github.com/stretchr/testify/require"

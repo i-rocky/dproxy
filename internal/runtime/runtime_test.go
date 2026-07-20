@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"dproxy/internal/engine"
-	networkpolicy "dproxy/internal/network"
-	"dproxy/internal/policy"
+	"github.com/i-rocky/dproxy/internal/engine"
+	networkpolicy "github.com/i-rocky/dproxy/internal/network"
+	"github.com/i-rocky/dproxy/internal/policy"
 
 	"github.com/stretchr/testify/require"
 )

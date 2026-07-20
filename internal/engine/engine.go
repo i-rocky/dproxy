@@ -5,7 +5,7 @@ import (
 	"io"
 	"os"
 
-	"dproxy/internal/policy"
+	"github.com/i-rocky/dproxy/internal/policy"
 )
 
 const (

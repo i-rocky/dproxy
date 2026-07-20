@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"dproxy/internal/engine"
-	networkpolicy "dproxy/internal/network"
-	"dproxy/internal/policy"
-	"dproxy/internal/testimage"
+	"github.com/i-rocky/dproxy/internal/engine"
+	networkpolicy "github.com/i-rocky/dproxy/internal/network"
+	"github.com/i-rocky/dproxy/internal/policy"
+	"github.com/i-rocky/dproxy/internal/testimage"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"

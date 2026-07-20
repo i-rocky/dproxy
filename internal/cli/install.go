@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"dproxy/internal/shim"
-	"dproxy/plugins/official"
+	"github.com/i-rocky/dproxy/internal/shim"
+	"github.com/i-rocky/dproxy/plugins/official"
 )
 
 const (

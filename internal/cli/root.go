@@ -10,8 +10,8 @@ import (
 	"runtime"
 	"strings"
 
-	"dproxy/internal/diagnostic"
-	"dproxy/internal/policy"
+	"github.com/i-rocky/dproxy/internal/diagnostic"
+	"github.com/i-rocky/dproxy/internal/policy"
 )
 
 // supportedOSes lists the host operating systems dproxy currently runs on.

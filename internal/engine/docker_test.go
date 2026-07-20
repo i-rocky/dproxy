@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"dproxy/internal/policy"
+	"github.com/i-rocky/dproxy/internal/policy"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"

@@ -1,4 +1,4 @@
-module dproxy
+module github.com/i-rocky/dproxy
 
 go 1.25.0
 

@@ -11,8 +11,8 @@ import (
 	"sync"
 	"testing"
 
-	"dproxy/internal/engine"
-	corepolicy "dproxy/internal/policy"
+	"github.com/i-rocky/dproxy/internal/engine"
+	corepolicy "github.com/i-rocky/dproxy/internal/policy"
 	"github.com/stretchr/testify/require"
 )
 
