@@ -188,6 +188,23 @@ func TestInstallAllWiresBashZshAndFishCompletion(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestInstallZshCompletionUsesFpathNotSource locks in the fix for the
+// "_tags can only be called from completion function" errors: zsh completions
+// must be registered on fpath and autoloaded by compinit, never sourced.
+func TestInstallZshCompletionUsesFpathNotSource(t *testing.T) {
+	systemEnvironment(t)
+	home := os.Getenv("HOME")
+	runner := systemRunner{}
+	streams := Streams{Stdout: new(bytes.Buffer), Stderr: new(bytes.Buffer)}
+	require.NoError(t, runner.Command(context.Background(), "install", []string{"--shell", "zsh"}, streams))
+	rc, err := os.ReadFile(filepath.Join(home, ".zshrc"))
+	require.NoError(t, err)
+	body := string(rc)
+	require.Contains(t, body, "fpath=(")
+	require.Contains(t, body, "compinit")
+	require.NotContains(t, body, "source", "sourcing a #compdef file runs it outside completion")
+}
+
 func TestInstallRcBlockStripsPriorBlocks(t *testing.T) {
 	systemEnvironment(t)
 	home := os.Getenv("HOME")

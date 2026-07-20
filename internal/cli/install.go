@@ -180,10 +180,10 @@ func wireShells(home, binDir, completionsDir string, shells []string) ([]string,
 		switch shell {
 		case "bash":
 			rcPath = filepath.Join(home, ".bashrc")
-			block = rcBlock(binDir, `"${XDG_DATA_HOME:-$HOME/.local/share}/dproxy/completions/dproxy.bash"`)
+			block = rcBlock(binDir, bashCompletionSetup())
 		case "zsh":
 			rcPath = filepath.Join(home, ".zshrc")
-			block = rcBlock(binDir, `"${XDG_DATA_HOME:-$HOME/.local/share}/dproxy/completions/_dproxy"`)
+			block = rcBlock(binDir, zshCompletionSetup())
 		case "fish":
 			// fish auto-loads completions from its config dir; no rc edit needed.
 			continue
@@ -198,13 +198,31 @@ func wireShells(home, binDir, completionsDir string, shells []string) ([]string,
 	return wired, nil
 }
 
-// rcBlock renders the idempotent marker-delimited block prepending binDir to
-// PATH and sourcing the completion script.
-func rcBlock(binDir, completionSource string) string {
+// completionsDirExpr is the shell-time location of the completion scripts,
+// resolved via XDG_DATA_HOME so it tracks the user's configuration.
+const completionsDirExpr = `"${XDG_DATA_HOME:-$HOME/.local/share}/dproxy/completions"`
+
+func bashCompletionSetup() string {
+	return fmt.Sprintf("[ -f %s/dproxy.bash ] && source %s/dproxy.bash", completionsDirExpr, completionsDirExpr)
+}
+
+// zshCompletionSetup wires the _dproxy completion via fpath + compinit. zsh
+// completions must NOT be sourced: a #compdef file runs its body when invoked,
+// so sourcing it at shell startup calls _tags/_describe outside any completion
+// context and errors with "_tags can only be called from completion function".
+// Putting the directory on fpath and running compinit registers _dproxy whether
+// the user's own compinit ran before or after this block.
+func zshCompletionSetup() string {
+	return fmt.Sprintf("fpath=(%s $fpath)\nautoload -Uz compinit && compinit", completionsDirExpr)
+}
+
+// rcBlock renders the idempotent marker-delimited block: prepends ~/.local/bin
+// to PATH only when absent, then runs the shell-specific completion setup.
+func rcBlock(binDir, completionSetup string) string {
 	return strings.Join([]string{
 		dproxyBlockBegin,
-		fmt.Sprintf(`export PATH="$HOME/.local/bin:$PATH"`),
-		fmt.Sprintf("[ -f %s ] && source %s", completionSource, completionSource),
+		`case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH";; esac`,
+		completionSetup,
 		dproxyBlockEnd,
 	}, "\n") + "\n"
 }
