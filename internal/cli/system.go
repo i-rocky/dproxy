@@ -460,8 +460,9 @@ func doctorCommand(ctx context.Context, streams Streams) error {
 // ensureGatewayImage provisions a digest-pinned gateway image: it resolves the
 // published gateway's platform digest and pulls it, falling back to building
 // from source (only possible in a source checkout). Returns a reference usable
-// as UserConfig.GatewayImage.
-func ensureGatewayImage(ctx context.Context) (string, error) {
+// as UserConfig.GatewayImage. It is a variable so doctor's autofix path can be
+// exercised in tests without a Docker engine.
+var ensureGatewayImage = func(ctx context.Context) (string, error) {
 	api, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
 	if err != nil {
 		return "", err

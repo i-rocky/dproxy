@@ -295,19 +295,43 @@ func TestExecuteSystemPlanComposesRuntimeAndMapsSandboxFailure(t *testing.T) {
 
 func TestDoctorUsesInjectedEngineVerification(t *testing.T) {
 	systemEnvironment(t)
-	writeUserConfig(t)
-	require.NoError(t, initProject(nil))
-	old := systemDoctorVerify
-	t.Cleanup(func() { systemDoctorVerify = old })
-	systemDoctorVerify = func(context.Context, config.UserConfig) error { return nil }
-	oldLoad := officialLoad
-	t.Cleanup(func() { officialLoad = oldLoad })
+	oldVerify, oldLoad, oldEnsure := systemDoctorVerify, officialLoad, ensureGatewayImage
+	t.Cleanup(func() { systemDoctorVerify, officialLoad, ensureGatewayImage = oldVerify, oldLoad, oldEnsure })
 	officialLoad = func() (map[string]plugin.Manifest, error) { return map[string]plugin.Manifest{"node": {}}, nil }
-	var out bytes.Buffer
-	require.NoError(t, (systemRunner{}).Command(context.Background(), "doctor", nil, Streams{Stdout: &out}))
-	require.Contains(t, out.String(), "all checks passed")
-	systemDoctorVerify = func(context.Context, config.UserConfig) error { return errors.New("offline") }
-	require.Error(t, doctorCommand(context.Background(), Streams{Stdout: &out}))
+	configPath := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "dproxy", "config.toml")
+
+	t.Run("engine unavailable fails fast", func(t *testing.T) {
+		systemDoctorVerify = func(context.Context, config.UserConfig) error { return errors.New("offline") }
+		require.Error(t, doctorCommand(context.Background(), Streams{Stdout: new(bytes.Buffer)}))
+	})
+	systemDoctorVerify = func(context.Context, config.UserConfig) error { return nil }
+
+	t.Run("missing config autofix provisions and writes", func(t *testing.T) {
+		_ = os.Remove(configPath)
+		ensureGatewayImage = func(context.Context) (string, error) {
+			return "ghcr.io/i-rocky/dproxy-gateway@sha256:" + strings.Repeat("a", 64), nil
+		}
+		var out bytes.Buffer
+		require.NoError(t, doctorCommand(context.Background(), Streams{Stdout: &out}))
+		require.Contains(t, out.String(), "FIXED")
+		_, err := config.LoadUser(configPath)
+		require.NoError(t, err, "autofix must write a valid configuration")
+	})
+
+	t.Run("autofix failure is reported", func(t *testing.T) {
+		_ = os.Remove(configPath)
+		ensureGatewayImage = func(context.Context) (string, error) { return "", errors.New("no gateway available") }
+		var out bytes.Buffer
+		require.Error(t, doctorCommand(context.Background(), Streams{Stdout: &out}))
+		require.Contains(t, out.String(), "gateway image: FAIL")
+	})
+
+	t.Run("valid config passes all checks", func(t *testing.T) {
+		writeUserConfig(t)
+		var out bytes.Buffer
+		require.NoError(t, (systemRunner{}).Command(context.Background(), "doctor", nil, Streams{Stdout: &out}))
+		require.Contains(t, out.String(), "all checks passed")
+	})
 }
 
 func TestCompatibilityModes(t *testing.T) {
