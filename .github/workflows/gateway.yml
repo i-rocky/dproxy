@@ -1,0 +1,35 @@
+name: gateway-image
+
+# Builds and publishes the deny-first nftables gateway image to ghcr.io on
+# every push to master. dproxy doctor resolves :latest to a digest for the
+# host platform, pulls it, and pins it in the user configuration — so a plain
+# `go install` user gets a working gateway without building from source.
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: cmd/gateway/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/i-rocky/dproxy-gateway:latest
+            ghcr.io/i-rocky/dproxy-gateway:${{ github.sha }}
