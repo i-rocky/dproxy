@@ -117,7 +117,7 @@ Ports are published only when explicitly configured. Publishing permits host-to-
 
 ## Plugins
 
-Plugins are versioned TOML manifests fetched from Git. They declare:
+Plugins are versioned TOML manifests. The official set is embedded in the dproxy binary (with build-derived provenance, so a plain `go install` works without release flags); additional plugins are fetched from explicitly trusted Git repositories. They declare:
 
 - Plugin name and schema version.
 - Provided binary names.
@@ -133,7 +133,7 @@ Plugins cannot contain executable hooks, shell fragments, arbitrary Docker argum
 
 Git synchronization never executes repository Git hooks, scripts, or binaries. Dproxy validates manifests strictly and rejects unknown fields. Project lockfiles pin repository URL, Git commit, manifest hash, and schema version. Updates display capability changes before acceptance.
 
-Dproxy supports an official curated plugin index and explicitly trusted community Git repositories. Adding a non-official repository requires an explicit trust action and records its immutable revision.
+Dproxy ships official plugins embedded in the binary and also supports explicitly trusted community Git repositories. Adding a non-official repository requires an explicit trust action and records its immutable revision.
 
 ## Shims and Commands
 
@@ -239,7 +239,7 @@ for the macOS and Windows backends live in `docs/platform-backends.md`.
 
 The CLI and gateway are implemented in Go. The project favors the standard library and a small reviewed dependency set.
 
-Expected components include Cobra for CLI dispatch, a strict TOML library, Masterminds semver constraints, the Docker Go SDK, `golang.org/x/term`, `golang.org/x/sys`, and standard-library `slog`. The gateway is published as a minimal signed dproxy image pinned by digest; users do not build it during command execution.
+Expected components include a hand-rolled CLI dispatcher, `pelletier/go-toml/v2`, Masterminds semver constraints, the Docker Go SDK, `golang.org/x/sys`, `miekg/dns`, and `google/nftables`. The gateway is published as a minimal signed dproxy image pinned by digest; users do not build it during command execution.
 
 GitHub Actions provides CI. Releases include signed binaries, checksums, a software bill of materials, gateway image metadata, and reproducible-build information where practical.
 

@@ -63,9 +63,12 @@ the filter.
 ### Per-tool egress
 
 A tool's outbound allowlist is derived from its plugin manifest
-(`npm`/`bun` → npmjs, `python` → pypi, `cargo` → crates.io, etc.). The
-effective allowlist is a floor-union: the tool always reaches its own registry
-fronts, and a project may widen but never narrow below that floor.
+(`npm`/`bun` → npmjs, `python` → pypi, `cargo` → crates.io, etc.). The official
+manifests ship **embedded in the dproxy binary** (with build-derived provenance);
+additional plugins come from explicitly trusted Git repositories
+(`dproxy plugin add --trust`). Either way, the effective allowlist is a
+floor-union: the tool always reaches its own registry fronts, and a project may
+widen but never narrow below that floor.
 
 ## Fail-closed guarantees
 

@@ -54,6 +54,31 @@ dproxy npm install   # runs `npm install` sandboxed
 signals, and exit status. `dproxy --explain <tool>` prints the resolved plan
 (mounts, egress allowlist, resource limits) without running anything.
 
+## Health check and setup
+
+```sh
+dproxy doctor
+```
+
+`dproxy doctor` verifies the Docker engine, the user configuration, and the
+bundled plugins. When the user configuration is missing it **auto-provisions**:
+it resolves the published gateway image for your platform, pulls it, and writes a
+digest-pinned `~/.config/dproxy/config.toml`. Run it once after install.
+
+## Plugins
+
+dproxy is driven by plugin manifests (TOML) that declare a tool's image, caches,
+commands, and registry egress. The official set — `node`/`npm`/`npx`, `python`/
+`pip`/`uv`, `go`/`gofmt`, `cargo`/`rustc`/`rustfmt`, `bun`/`bunx` — is **embedded
+in the dproxy binary**, with provenance (repository + commit + manifest digest)
+derived from the build so a plain `go install` works without release flags. To
+use additional or custom plugins, trust an external Git repository:
+
+```sh
+dproxy plugin add --trust https://github.com/you/your-dproxy-plugins
+dproxy plugin list
+```
+
 ## How it works
 
 For each invocation dproxy finds the nearest `.dproxy.toml`, verifies
