@@ -402,3 +402,10 @@ func TestSystemUsageFailures(t *testing.T) {
 		require.Error(t, cacheCommand(args, streams), args)
 	}
 }
+
+func TestEnsureRootParentsCreatesMissingXDGParent(t *testing.T) {
+	root := t.TempDir()
+	cache := filepath.Join(root, "cache", "dproxy") // parent "cache" does not exist yet
+	require.NoError(t, ensureRootParents(cache))
+	require.DirExists(t, filepath.Dir(cache))
+}

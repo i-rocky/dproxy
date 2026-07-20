@@ -608,6 +608,9 @@ func loadSystemState(ctx context.Context, binary string, readOnly bool) (systemS
 	if err != nil {
 		return systemState{}, err
 	}
+	if err := ensureRootParents(cacheRoot, stateRoot, dataRoot); err != nil {
+		return systemState{}, err
+	}
 	locked, err := lock.Load(filepath.Join(p.Root, ".dproxy.lock"))
 	if err != nil {
 		return systemState{}, fmt.Errorf("load lock (run dproxy lock): %w", err)
@@ -663,6 +666,9 @@ func findProject(start string, readOnly bool) (project.Project, error) {
 func loadGlobalSystemState(ctx context.Context, binary string, readOnly bool) (systemState, error) {
 	cacheRoot, stateRoot, dataRoot, err := userRoots()
 	if err != nil {
+		return systemState{}, err
+	}
+	if err := ensureRootParents(cacheRoot, stateRoot, dataRoot); err != nil {
 		return systemState{}, err
 	}
 	// Resolve the manifest before requiring user configuration so a typo fails
@@ -755,6 +761,23 @@ func loadUserConfig() (config.UserConfig, error) {
 		return config.UserConfig{}, fmt.Errorf("load user configuration (set a pinned gateway image): %w", err)
 	}
 	return user, nil
+}
+
+// ensureRootParents creates the standard XDG parent directories (~/.cache,
+// ~/.local/state, ~/.local/share) when absent. The cache manager opens its root
+// with openat2/beneath semantics and only creates the final component, so a
+// missing parent (e.g. ~/.cache on a fresh home) would otherwise fail with
+// "file does not exist" on the first run.
+func ensureRootParents(roots ...string) error {
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(root), 0700); err != nil {
+			return fmt.Errorf("create %s: %w", filepath.Dir(root), err)
+		}
+	}
+	return nil
 }
 
 func userRoots() (string, string, string, error) {
