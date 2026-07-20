@@ -8,19 +8,84 @@ import (
 	"errors"
 	"net/url"
 	"regexp"
+	"runtime/debug"
 	"strings"
 
 	"github.com/i-rocky/dproxy/internal/plugin"
 )
 
-// Set by release ldflags. Development builds intentionally have no synthetic
-// provenance and must use an explicitly added plugin repository.
+// OfficialRepository and Commit pin the source of the bundled official plugins.
+// They may be set by release ldflags; otherwise deriveOfficialProvenance fills
+// them from Go's build info so a plain `go install ...@latest` build carries
+// verifiable provenance without ldflags.
 var OfficialRepository, Commit string
 
 //go:embed *.toml
 var manifests embed.FS
 
-var commitPattern = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+// commitPattern accepts Git commit identifiers: full sha1/sha256 hashes (40/64
+// hex) and the short-SHA form Go records in a module pseudo-version (12 hex,
+// Git's modern short length). External trusted repos always pin the full hash;
+// the 12-hex form is only used for bundled plugins in a plain go-install build.
+var commitPattern = regexp.MustCompile(`^(?:[0-9a-f]{12}|[0-9a-f]{40}|[0-9a-f]{64})$`)
+
+func init() {
+	deriveOfficialProvenance()
+}
+
+// deriveOfficialProvenance populates OfficialRepository and Commit from the
+// build info when ldflags did not set them. A local VCS build exposes the full
+// vcs.revision; a plain `go install module@version` build exposes only the
+// module path and a pseudo-version, whose 12-hex suffix is the commit.
+func deriveOfficialProvenance() {
+	if OfficialRepository != "" && Commit != "" {
+		return
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return
+	}
+	if OfficialRepository == "" {
+		OfficialRepository = repositoryFromModule(info.Main.Path)
+	}
+	if Commit == "" {
+		Commit = commitFromBuildInfo(info)
+	}
+}
+
+func repositoryFromModule(path string) string {
+	if path == "" {
+		return ""
+	}
+	host := strings.SplitN(path, "/", 2)[0]
+	if !strings.Contains(host, ".") {
+		return "" // not a host-prefixed module path (e.g. a local replace)
+	}
+	repo := "https://" + path
+	parsed, err := url.Parse(repo)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	return repo
+}
+
+func commitFromBuildInfo(info *debug.BuildInfo) string {
+	for _, s := range info.Settings {
+		if s.Key == "vcs.revision" && commitPattern.MatchString(s.Value) {
+			return s.Value
+		}
+	}
+	return commitFromPseudoVersion(info.Main.Version)
+}
+
+var pseudoVersionPattern = regexp.MustCompile(`^v\d+\.\d+\.\d+-\d{14}-([0-9a-f]{12})$`)
+
+func commitFromPseudoVersion(version string) string {
+	if m := pseudoVersionPattern.FindStringSubmatch(version); len(m) == 2 {
+		return m[1]
+	}
+	return ""
+}
 
 func Load() (map[string]plugin.Manifest, error) {
 	parsed, err := url.Parse(OfficialRepository)

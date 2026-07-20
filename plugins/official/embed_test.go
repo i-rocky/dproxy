@@ -53,6 +53,17 @@ func TestLoadProvenanceValidation(t *testing.T) {
 	})
 }
 
+// TestDeriveProvenanceFromBuildInfo confirms a plain `go install module@version`
+// build (no ldflags, no vcs.revision) still derives verifiable provenance from
+// the module path and pseudo-version, so the bundled plugins load without
+// release ldflags.
+func TestDeriveProvenanceFromBuildInfo(t *testing.T) {
+	require.Equal(t, "1536a011c5f6", commitFromPseudoVersion("v0.0.0-20260720162621-1536a011c5f6"))
+	require.Equal(t, "", commitFromPseudoVersion("v1.2.3"), "a real tag is not a pseudo-version")
+	require.Equal(t, "https://github.com/i-rocky/dproxy", repositoryFromModule("github.com/i-rocky/dproxy"))
+	require.Equal(t, "", repositoryFromModule("example/local"), "non-host module path yields no repository")
+}
+
 // TestBinariesEnumeratesUniqueTools confirms shim enumeration yields each bundled
 // binary exactly once across all manifests.
 func TestBinariesEnumeratesUniqueTools(t *testing.T) {
