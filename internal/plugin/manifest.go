@@ -3,6 +3,7 @@ package plugin
 import (
 	"errors"
 	"io"
+	"net/netip"
 	"path"
 	"regexp"
 	"strconv"
@@ -22,6 +23,7 @@ type Manifest struct {
 	Images      map[string]Image    `toml:"images"`
 	Commands    map[string][]string `toml:"commands"`
 	Caches      []Cache             `toml:"caches"`
+	Egress      []EgressRule        `toml:"egress"`
 	Environment map[string]string   `toml:"environment"`
 	Platforms   []Platform          `toml:"platforms"`
 	Provenance  Provenance          `toml:"-"`
@@ -45,6 +47,14 @@ type Cache struct {
 type Platform struct {
 	OS   string `toml:"os"`
 	Arch string `toml:"arch"`
+}
+
+// EgressRule declares the registry fronts a tool may reach from the sandbox.
+// It is a floor: the effective allowlist is the union of manifest egress and
+// any user-declared allowlist, so a tool can always reach its own registry.
+type EgressRule struct {
+	Host  string `toml:"host"`
+	Ports []int  `toml:"ports"`
 }
 
 func LoadManifest(r io.Reader) (Manifest, error) {
@@ -120,6 +130,29 @@ func Validate(m Manifest) error {
 		}
 		cachePaths[cache.Path] = struct{}{}
 	}
+	egressHosts := make(map[string]struct{}, len(m.Egress))
+	for _, rule := range m.Egress {
+		if !validEgressHost(rule.Host) {
+			return fail("invalid egress host")
+		}
+		if _, exists := egressHosts[rule.Host]; exists {
+			return fail("duplicate egress host")
+		}
+		egressHosts[rule.Host] = struct{}{}
+		if len(rule.Ports) == 0 {
+			return fail("egress rule requires ports")
+		}
+		seenPorts := make(map[int]struct{}, len(rule.Ports))
+		for _, port := range rule.Ports {
+			if port < 1 || port > 65535 {
+				return fail("invalid egress port")
+			}
+			if _, exists := seenPorts[port]; exists {
+				return fail("duplicate egress port")
+			}
+			seenPorts[port] = struct{}{}
+		}
+	}
 	for key, value := range m.Environment {
 		if key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsRune(value, '\x00') {
 			return fail("invalid fixed environment")
@@ -137,7 +170,49 @@ var (
 	imageRepositoryPattern = regexp.MustCompile(`^[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[1-9][0-9]{0,4})?/[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$`)
 	pluginNamePattern      = regexp.MustCompile(`^[a-z0-9]+(?:[._-][a-z0-9]+)*$`)
 	dockerTagPattern       = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
+	egressLabelPattern     = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$`)
 )
+
+// validEgressHost is a light structural check; full IDNA canonicalization and
+// numeric-host rejection happen later in network.Allowlist. Rejecting IP
+// literals and inet_aton forms here gives early, manifest-load-time failure.
+func validEgressHost(host string) bool {
+	if host == "" || len(host) > 253 || !strings.Contains(host, ".") {
+		return false
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return false
+	}
+	if ambiguousNumericHost(host) {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !egressLabelPattern.MatchString(label) {
+			return false
+		}
+	}
+	return true
+}
+
+// ambiguousNumericHost mirrors network.ambiguousNumeric so legacy inet_aton
+// forms (127.1, octal, a single integer) are rejected as egress hosts.
+func ambiguousNumericHost(host string) bool {
+	parts := strings.Split(host, ".")
+	if len(parts) > 4 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		if _, err := strconv.ParseUint(part, 0, 32); err != nil {
+			if _, err := strconv.ParseUint(part, 10, 32); err != nil {
+				return false
+			}
+		}
+	}
+	return true
+}
 
 func validImageRepository(repository string) bool {
 	if !imageRepositoryPattern.MatchString(repository) {

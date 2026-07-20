@@ -56,22 +56,23 @@ func TestBuildCopiesCollections(t *testing.T) {
 
 func TestBuildRejectsUnsafeInputs(t *testing.T) {
 	cases := map[string]func(*Input){
-		"unknown command":        func(i *Input) { i.Binary = "sh" },
-		"mutated command prefix": func(i *Input) { i.Manifest.Commands["npm"][0] = "sh" },
-		"command control":        func(i *Input) { i.Manifest.Commands["npm"] = []string{"npm", "bad\narg"} },
-		"unlocked image":         func(i *Input) { i.Tool.Digest = "latest" },
-		"wrong platform":         func(i *Input) { i.Platform = "linux/arm64" },
-		"root project":           func(i *Input) { i.ProjectRoot = "/" },
-		"outside workdir":        func(i *Input) { i.RelativeWorkdir = "../escape" },
-		"reserved env":           func(i *Input) { i.Sandbox.Environment["HOME"] = "/host" },
-		"reserved plugin env":    func(i *Input) { i.Manifest.Environment["PATH"] = "/evil" },
-		"invalid env":            func(i *Input) { i.Sandbox.Environment["BAD=KEY"] = "x" },
-		"unsafe port":            func(i *Input) { i.Sandbox.Ports = map[string]int{"0": 3000} },
-		"bad pids":               func(i *Input) { i.Sandbox.PIDs = -1 },
-		"bad cpu":                func(i *Input) { i.Sandbox.CPUs = 65 },
-		"bad memory":             func(i *Input) { i.Sandbox.Memory = "unlimited" },
-		"unknown network":        func(i *Input) { i.Sandbox.Network = "host" },
-		"missing cache":          func(i *Input) { i.CachePaths = map[string]string{} },
+		"unknown command":                func(i *Input) { i.Binary = "sh" },
+		"mutated command prefix":         func(i *Input) { i.Manifest.Commands["npm"][0] = "sh" },
+		"command control":                func(i *Input) { i.Manifest.Commands["npm"] = []string{"npm", "bad\narg"} },
+		"unlocked image":                 func(i *Input) { i.Tool.Digest = "latest" },
+		"wrong platform":                 func(i *Input) { i.Platform = "linux/arm64" },
+		"root project":                   func(i *Input) { i.ProjectRoot = "/" },
+		"outside workdir":                func(i *Input) { i.RelativeWorkdir = "../escape" },
+		"reserved env":                   func(i *Input) { i.Sandbox.Environment["HOME"] = "/host" },
+		"reserved plugin env":            func(i *Input) { i.Manifest.Environment["PATH"] = "/evil" },
+		"invalid env":                    func(i *Input) { i.Sandbox.Environment["BAD=KEY"] = "x" },
+		"unsafe port":                    func(i *Input) { i.Sandbox.Ports = map[string]int{"0": 3000} },
+		"bad pids":                       func(i *Input) { i.Sandbox.PIDs = -1 },
+		"bad cpu":                        func(i *Input) { i.Sandbox.CPUs = 65 },
+		"bad memory":                     func(i *Input) { i.Sandbox.Memory = "unlimited" },
+		"unknown network":                func(i *Input) { i.Sandbox.Network = "host" },
+		"allowlist without destinations": func(i *Input) { i.Sandbox.Network = "allowlist" },
+		"missing cache":                  func(i *Input) { i.CachePaths = map[string]string{} },
 		"protected cache target": func(i *Input) {
 			i.Manifest.Caches[0].Path = "/tmp/cache"
 			i.CachePaths["/tmp/cache"] = i.CachePaths["/home/node/.npm"]
@@ -105,6 +106,69 @@ func TestBuildAppliesFiniteDefaultResourceLimits(t *testing.T) {
 	require.Equal(t, int64(4<<30), got.MemoryBytes)
 	require.Equal(t, float64(2), got.CPUs)
 	require.Equal(t, 512, got.Pids)
+}
+
+func TestBuildDerivesEgressAllowlist(t *testing.T) {
+	egress := []plugin.EgressRule{{Host: "registry.npmjs.org", Ports: []int{443}}}
+
+	t.Run("unset network derives allowlist from manifest egress", func(t *testing.T) {
+		in := validInput(t, "npm", nil)
+		in.Sandbox.Network = ""
+		in.Manifest.Egress = egress
+		got, err := Build(in)
+		require.NoError(t, err)
+		require.Equal(t, "allowlist", got.Network.Mode)
+		require.Equal(t, []string{"registry.npmjs.org:443"}, got.Network.Allowlist)
+	})
+
+	t.Run("unset network without manifest egress stays none", func(t *testing.T) {
+		in := validInput(t, "npm", nil)
+		in.Sandbox.Network = ""
+		got, err := Build(in)
+		require.NoError(t, err)
+		require.Equal(t, "none", got.Network.Mode)
+		require.Empty(t, got.Network.Allowlist)
+	})
+
+	t.Run("allowlist unions manifest floor with user entries", func(t *testing.T) {
+		in := validInput(t, "npm", nil)
+		in.Sandbox.Network = "allowlist"
+		in.Sandbox.NetworkAllowlist = []string{"custom.example:443"}
+		in.Manifest.Egress = egress
+		got, err := Build(in)
+		require.NoError(t, err)
+		require.Equal(t, "allowlist", got.Network.Mode)
+		require.Equal(t, []string{"registry.npmjs.org:443", "custom.example:443"}, got.Network.Allowlist)
+	})
+
+	t.Run("allowlist satisfied by manifest egress alone", func(t *testing.T) {
+		in := validInput(t, "npm", nil)
+		in.Sandbox.Network = "allowlist"
+		in.Manifest.Egress = egress
+		got, err := Build(in)
+		require.NoError(t, err)
+		require.Equal(t, []string{"registry.npmjs.org:443"}, got.Network.Allowlist)
+	})
+
+	t.Run("none ignores manifest egress", func(t *testing.T) {
+		in := validInput(t, "npm", nil)
+		in.Sandbox.Network = "none"
+		in.Manifest.Egress = egress
+		got, err := Build(in)
+		require.NoError(t, err)
+		require.Equal(t, "none", got.Network.Mode)
+		require.NotContains(t, got.Network.Allowlist, "registry.npmjs.org:443")
+	})
+
+	t.Run("public ignores manifest egress", func(t *testing.T) {
+		in := validInput(t, "npm", nil)
+		in.Sandbox.Network = "public"
+		in.Manifest.Egress = egress
+		got, err := Build(in)
+		require.NoError(t, err)
+		require.Equal(t, "public", got.Network.Mode)
+		require.NotContains(t, got.Network.Allowlist, "registry.npmjs.org:443")
+	})
 }
 
 func TestBuildRejectsSymlinkEscapes(t *testing.T) {

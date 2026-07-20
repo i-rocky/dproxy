@@ -70,11 +70,29 @@ func TestManifestValidation(t *testing.T) {
 		valid + "[[caches]]\npath=\"/cache\"\n[[caches]]\npath=\"/cache\"\n",
 		valid + "[environment]\n\"BAD=KEY\"=\"x\"\n",
 		valid + "[[platforms]]\nos=\"linux\"\narch=\"\"\n",
+		valid + "[[egress]]\nhost=\"no-dot\"\nports=[443]\n",
+		valid + "[[egress]]\nhost=\"10.0.0.1\"\nports=[443]\n",
+		valid + "[[egress]]\nhost=\"127.1\"\nports=[443]\n",
+		valid + "[[egress]]\nhost=\"bad label.example\"\nports=[443]\n",
+		valid + "[[egress]]\nhost=\"a.example\"\nports=[]\n",
+		valid + "[[egress]]\nhost=\"a.example\"\nports=[0]\n",
+		valid + "[[egress]]\nhost=\"a.example\"\nports=[70000]\n",
+		valid + "[[egress]]\nhost=\"a.example\"\nports=[443,443]\n",
+		valid + "[[egress]]\nhost=\"a.example\"\nports=[443]\n[[egress]]\nhost=\"a.example\"\nports=[80]\n",
 	}
 	for _, input := range cases {
 		_, err := LoadManifest(strings.NewReader(input))
 		require.Error(t, err)
 	}
+}
+
+func TestManifestAcceptsEgress(t *testing.T) {
+	input := "schema=1\nname=\"x\"\nbins=[\"x\"]\ncommands={x=[\"x\"]}\n[images.default]\nrepository=\"registry.example/x\"\ntag_template=\"{version}\"\n[[egress]]\nhost=\"registry.example\"\nports=[443,80]\n"
+	manifest, err := LoadManifest(strings.NewReader(input))
+	require.NoError(t, err)
+	require.Len(t, manifest.Egress, 1)
+	require.Equal(t, "registry.example", manifest.Egress[0].Host)
+	require.Equal(t, []int{443, 80}, manifest.Egress[0].Ports)
 }
 
 func TestValidateRejectsProgrammaticManifestMutation(t *testing.T) {

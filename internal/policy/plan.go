@@ -49,6 +49,7 @@ type Input struct {
 	Tool                                                                               lock.Tool
 	Manifest                                                                           plugin.Manifest
 	Sandbox                                                                            config.Sandbox
+	ReadOnlyPlanning                                                                   bool
 }
 
 var reserved = map[string]struct{}{"HOME": {}, "PATH": {}, "HOSTNAME": {}, "DOCKER_HOST": {}, "SSH_AUTH_SOCK": {}, "GPG_AGENT_INFO": {}, "XDG_CACHE_HOME": {}, "XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}}
@@ -88,6 +89,9 @@ func Build(in Input) (Plan, error) {
 		workdir += "/" + filepath.ToSlash(rel)
 	}
 	cacheRoot, err := physicalDirectory(in.CacheRoot)
+	if in.ReadOnlyPlanning && errors.Is(err, os.ErrNotExist) {
+		cacheRoot, err = filepath.Abs(in.CacheRoot)
+	}
 	if err != nil || cacheRoot == string(filepath.Separator) {
 		return Plan{}, errors.New("invalid cache manager root")
 	}
@@ -104,6 +108,9 @@ func Build(in Input) (Plan, error) {
 			return Plan{}, fmt.Errorf("missing managed cache for %s", decl.Path)
 		}
 		physical, e := physicalDirectory(source)
+		if in.ReadOnlyPlanning && errors.Is(e, os.ErrNotExist) {
+			physical, e = filepath.Abs(source)
+		}
 		if e != nil || !within(cacheRoot, physical) || decl.Path == "/" {
 			return Plan{}, errors.New("cache path is outside cache manager authority")
 		}
@@ -139,14 +146,28 @@ func Build(in Input) (Plan, error) {
 		memory = 4 << 30
 	}
 	network := in.Sandbox.Network
+	manifestEgress := manifestEgressEntries(in.Manifest.Egress)
 	if network == "" {
-		network = "none"
+		// Frictionless default: when a project leaves the network unset, a tool
+		// whose manifest declares egress gets a derived allowlist scoped to its
+		// own registry fronts; otherwise it stays fully isolated.
+		if len(manifestEgress) > 0 {
+			network = "allowlist"
+		} else {
+			network = "none"
+		}
 	}
 	if network != "none" && network != "public" && network != "allowlist" {
 		return Plan{}, errors.New("invalid network policy")
 	}
-	if network == "allowlist" && len(in.Sandbox.NetworkAllowlist) == 0 {
-		return Plan{}, errors.New("allowlist network requires destinations")
+	// Manifest egress is a floor, unioned into the allowlist so a tool can
+	// always reach its own registry; the user may widen, never narrow below it.
+	allowlist := append([]string(nil), in.Sandbox.NetworkAllowlist...)
+	if network == "allowlist" {
+		allowlist = unionAllowlist(manifestEgress, allowlist)
+		if len(allowlist) == 0 {
+			return Plan{}, errors.New("allowlist network requires destinations")
+		}
 	}
 	ports := make([]Port, 0, len(in.Sandbox.Ports))
 	for hostRaw, container := range in.Sandbox.Ports {
@@ -164,7 +185,7 @@ func Build(in Input) (Plan, error) {
 	})
 	command := append([]string(nil), prefix...)
 	command = append(command, in.Arguments...)
-	return Plan{InvocationID: in.InvocationID, ProjectID: in.ProjectID, Image: in.Tool.Image + "@" + in.Tool.Digest, Workdir: workdir, Command: command, Environment: env, Mounts: mounts, Tmpfs: []Tmpfs{{"/tmp", 01777}, {"/home/dproxy", 0700}}, Ports: ports, UID: in.UID, GID: in.GID, Pids: pids, MemoryBytes: memory, CPUs: float64(cpus), ReadOnlyRoot: true, NoNewPrivileges: true, AutoRemove: true, CapDrop: []string{"ALL"}, Network: Network{Mode: network, Allowlist: append([]string(nil), in.Sandbox.NetworkAllowlist...)}}, nil
+	return Plan{InvocationID: in.InvocationID, ProjectID: in.ProjectID, Image: in.Tool.Image + "@" + in.Tool.Digest, Workdir: workdir, Command: command, Environment: env, Mounts: mounts, Tmpfs: []Tmpfs{{"/tmp", 01777}, {"/home/dproxy", 0700}}, Ports: ports, UID: in.UID, GID: in.GID, Pids: pids, MemoryBytes: memory, CPUs: float64(cpus), ReadOnlyRoot: true, NoNewPrivileges: true, AutoRemove: true, CapDrop: []string{"ALL"}, Network: Network{Mode: network, Allowlist: allowlist}}, nil
 }
 
 func physicalDirectory(path string) (string, error) {
@@ -184,6 +205,41 @@ func physicalDirectory(path string) (string, error) {
 func within(root, path string) bool {
 	rel, err := filepath.Rel(root, path)
 	return err == nil && rel != ".." && !filepath.IsAbs(rel) && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// manifestEgressEntries expands a manifest's egress rules into "host:port"
+// entries in declaration order.
+func manifestEgressEntries(rules []plugin.EgressRule) []string {
+	if len(rules) == 0 {
+		return nil
+	}
+	entries := make([]string, 0, len(rules))
+	for _, rule := range rules {
+		for _, port := range rule.Ports {
+			entries = append(entries, fmt.Sprintf("%s:%d", rule.Host, port))
+		}
+	}
+	return entries
+}
+
+// unionAllowlist merges manifest egress (floor) with user-declared entries,
+// preserving order and dropping duplicates.
+func unionAllowlist(manifest, user []string) []string {
+	seen := make(map[string]struct{}, len(manifest)+len(user))
+	merged := make([]string, 0, len(manifest)+len(user))
+	for _, entry := range manifest {
+		if _, ok := seen[entry]; !ok {
+			seen[entry] = struct{}{}
+			merged = append(merged, entry)
+		}
+	}
+	for _, entry := range user {
+		if _, ok := seen[entry]; !ok {
+			seen[entry] = struct{}{}
+			merged = append(merged, entry)
+		}
+	}
+	return merged
 }
 func addEnvironment(env map[string]string, k, v string, rejectReserved bool) error {
 	if k == "" || strings.ContainsAny(k, "=\x00") || strings.ContainsRune(v, '\x00') {

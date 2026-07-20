@@ -8,6 +8,18 @@ tag_template = "{version}"
 [[caches]]
 path = "/usr/local/cargo/registry"
 compatibility = "minor"
+[[egress]]
+host = "index.crates.io"
+ports = [443]
+[[egress]]
+host = "static.crates.io"
+ports = [443]
+[[egress]]
+host = "crates.io"
+ports = [443]
+[[egress]]
+host = "static.rust-lang.org"
+ports = [443]
 [[platforms]]
 os = "linux"
 arch = "amd64"

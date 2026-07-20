@@ -8,6 +8,9 @@ tag_template = "{version}"
 [[caches]]
 path = "/home/bun/.bun/install/cache"
 compatibility = "major"
+[[egress]]
+host = "registry.npmjs.org"
+ports = [443]
 [[platforms]]
 os = "linux"
 arch = "amd64"
