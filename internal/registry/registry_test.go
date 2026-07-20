@@ -122,3 +122,14 @@ func TestRegistrySingleManifestAndMissingPlatform(t *testing.T) {
 	_, err = New(indexClient).Digest(context.Background(), "registry.test/team/tool:v1", "linux/arm64")
 	require.Error(t, err)
 }
+
+func TestParseRepositoryMapsDockerHubNamespaceToRegistry(t *testing.T) {
+	host, path, err := parseRepository("docker.io/library/python")
+	require.NoError(t, err)
+	require.Equal(t, "registry-1.docker.io", host, "docker.io must resolve to Docker Hub's registry API endpoint")
+	require.Equal(t, "library/python", path)
+
+	host, _, err = parseRepository("ghcr.io/owner/tool")
+	require.NoError(t, err)
+	require.Equal(t, "ghcr.io", host, "other registries pass through unchanged")
+}

@@ -19,7 +19,12 @@ type UserConfig struct {
 	PluginRepositories []string `toml:"plugin_repositories,omitempty"`
 }
 
-var gatewayPattern = regexp.MustCompile(`^[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[1-9][0-9]{0,4})?/[a-z0-9]+(?:[._/-][a-z0-9]+)*@sha256:[0-9a-f]{64}$`)
+// gatewayPattern accepts either a registry digest reference
+// (host[:port]/path@sha256:...) or a bare local image ID (sha256:...). The
+// registry form is the production path (a published gateway); the local-ID form
+// lets a from-source build pin a locally-built gateway without a registry. The
+// run path (engine + orchestrator) already treats a sha256: ID as a local image.
+var gatewayPattern = regexp.MustCompile(`^(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[1-9][0-9]{0,4})?/[a-z0-9]+(?:[._/-][a-z0-9]+)*@sha256:[0-9a-f]{64}|sha256:[0-9a-f]{64})$`)
 
 func (c *Config) SetTool(name, constraint string) error {
 	if !safeTool(name) || strings.TrimSpace(constraint) == "" {

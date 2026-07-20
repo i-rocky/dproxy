@@ -249,7 +249,14 @@ func parseRepository(raw string) (string, string, error) {
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(parts[1], "..") {
 		return "", "", errors.New("invalid repository")
 	}
-	return parts[0], strings.Trim(parts[1], "/"), nil
+	host := parts[0]
+	if host == "docker.io" {
+		// "docker.io" is Docker Hub's canonical namespace; its registry API is
+		// served by registry-1.docker.io. Hitting https://docker.io/v2/... 302-
+		// redirects and the client does not follow redirects.
+		host = "registry-1.docker.io"
+	}
+	return host, strings.Trim(parts[1], "/"), nil
 }
 func parseTagged(raw string) (string, string, string, error) {
 	i := strings.LastIndex(raw, ":")
