@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  test:
+    name: vet, build, race, coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "::error::gofmt needed on: $out"; echo "$out"; exit 1; fi
+      - run: go vet ./...
+      - run: go build ./...
+      - run: go test -race ./...
+      - name: coverage gate (>80%, cross-package)
+        run: |
+          go test -coverpkg=./... -coverprofile=coverage.out ./... >/dev/null
+          go run ./tools/covercheck coverage.out
+
+  integration:
+    name: integration (docker dataplane)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -tags=integration ./test/integration -count=1 -timeout 10m -v
