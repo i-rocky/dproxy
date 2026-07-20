@@ -30,6 +30,9 @@ func systemEnvironment(t *testing.T) string {
 		t.Setenv(key, value)
 		require.NoError(t, os.MkdirAll(value, 0700))
 	}
+	// Hermetic PATH: only the managed bin dir. Install must not be influenced by
+	// tools that happen to exist on the host (nvm node, system go, etc.).
+	t.Setenv("PATH", filepath.Join(root, "home", ".local", "bin"))
 	old, err := os.Getwd()
 	require.NoError(t, err)
 	require.NoError(t, os.Chdir(root))

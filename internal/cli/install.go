@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/i-rocky/dproxy/internal/shim"
@@ -51,7 +53,8 @@ func installCommand(args []string, streams Streams) error {
 		return err
 	}
 	manager := shim.Manager{BinDir: binDir, ShimDir: shimDir, Executable: executable}
-	if err := manager.Sync(targets); err != nil {
+	keep, skipped := manageableTargets(manager, targets)
+	if err := manager.Sync(keep); err != nil {
 		return err
 	}
 	completionsDir := filepath.Join(dataRoot, "completions")
@@ -62,12 +65,40 @@ func installCommand(args []string, streams Streams) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(streams.Stdout, "installed %d managed tool shims\n", len(targets))
+	fmt.Fprintf(streams.Stdout, "installed %d managed tool shims\n", len(keep))
+	if len(skipped) > 0 {
+		fmt.Fprintf(streams.Stdout, "skipped %d tools already on PATH (not overridden): %s\n", len(skipped), strings.Join(skipped, ", "))
+	}
 	if len(wired) > 0 {
 		fmt.Fprintf(streams.Stdout, "wired shell rc: %s\n", strings.Join(wired, ", "))
 		fmt.Fprintln(streams.Stdout, "restart your shell or open a new terminal for PATH and completion to take effect")
 	}
 	return nil
+}
+
+// pathLookup resolves a command name on PATH. It is a variable so tests can
+// inject resolution without mutating the process environment.
+var pathLookup = exec.LookPath
+
+// manageableTargets filters the official tool set to those dproxy should manage.
+// A tool is skipped when a command of the same name already resolves on PATH to
+// anything other than a dproxy-managed shim — whether an unmanaged file in the
+// target bin dir or a system/nvm/cargo install elsewhere — so dproxy never
+// overrides an existing command. A name already pointing at a dproxy shim is
+// kept (re-synced); a name not on PATH at all is installed.
+func manageableTargets(m shim.Manager, targets map[string]shim.Target) (map[string]shim.Target, []string) {
+	keep := make(map[string]shim.Target, len(targets))
+	var skipped []string
+	for name, target := range targets {
+		resolved, err := pathLookup(name)
+		if err == nil && !m.IsManagedShim(resolved) {
+			skipped = append(skipped, name)
+			continue
+		}
+		keep[name] = target
+	}
+	sort.Strings(skipped)
+	return keep, skipped
 }
 
 // targetShells resolves which shell rc files to wire from --shell/--all flags or

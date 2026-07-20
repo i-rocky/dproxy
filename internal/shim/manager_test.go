@@ -44,6 +44,23 @@ func TestShimRefusesUnmanagedCollision(t *testing.T) {
 	require.ErrorIs(t, m.Sync(map[string]Target{"node": {Binary: "node"}}), ErrCollision)
 }
 
+func TestIsManagedShimClassifiesResolvedPath(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	// A synced dproxy shim is recognized as managed (relative symlink resolved).
+	require.True(t, m.IsManagedShim(filepath.Join(m.BinDir, "node")))
+	// A plain file is not a managed shim.
+	plain := filepath.Join(m.BinDir, "uv")
+	require.NoError(t, os.WriteFile(plain, []byte("real"), 0700))
+	require.False(t, m.IsManagedShim(plain))
+	// A symlink pointing somewhere else is not a managed shim.
+	rogue := filepath.Join(m.BinDir, "go")
+	require.NoError(t, os.Symlink("/usr/local/go/bin/go", rogue))
+	require.False(t, m.IsManagedShim(rogue))
+	// A missing path is not a managed shim.
+	require.False(t, m.IsManagedShim(filepath.Join(m.BinDir, "nope")))
+}
+
 func TestShimRejectsUnsafeNames(t *testing.T) {
 	m := newShimManager(t)
 	require.ErrorIs(t, m.Sync(map[string]Target{"../node": {Binary: "node"}}), ErrUnsafeName)

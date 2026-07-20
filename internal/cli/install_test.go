@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/i-rocky/dproxy/internal/shim"
 	"github.com/stretchr/testify/require"
 )
 
@@ -98,6 +100,73 @@ func mustTargetShells(t *testing.T, args []string) []string {
 	shells, err := targetShells(args)
 	require.NoError(t, err)
 	return shells
+}
+
+// TestManageableTargetsSkipsExistingCommands verifies install never overrides a
+// command that already resolves on PATH (an nvm node, a system go, an unmanaged
+// ~/.local/bin file), while still installing absent tools and re-syncing its own
+// existing shims.
+func TestManageableTargetsSkipsExistingCommands(t *testing.T) {
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	shimDir := filepath.Join(root, "shims")
+	require.NoError(t, os.MkdirAll(binDir, 0700))
+	require.NoError(t, os.MkdirAll(shimDir, 0700))
+	// The dproxy generic shim must exist so EvalSymlinks resolves managed links.
+	require.NoError(t, os.WriteFile(filepath.Join(shimDir, "dproxy-shim"), []byte("#!/bin/sh\n"), 0700))
+	// "node" already managed by dproxy (symlink to the generic shim) -> keep/re-sync.
+	managedNode := filepath.Join(binDir, "node")
+	require.NoError(t, os.Symlink(filepath.Join(shimDir, "dproxy-shim"), managedNode))
+
+	// pathLookup: node -> managed shim; go -> system binary (unmanaged); rustc -> absent.
+	prev := pathLookup
+	t.Cleanup(func() { pathLookup = prev })
+	pathLookup = func(name string) (string, error) {
+		switch name {
+		case "node":
+			return managedNode, nil
+		case "go":
+			return "/usr/local/go/bin/go", nil
+		default:
+			return "", exec.ErrNotFound
+		}
+	}
+
+	m := shim.Manager{BinDir: binDir, ShimDir: shimDir}
+	targets := map[string]shim.Target{"node": {Binary: "node"}, "go": {Binary: "go"}, "rustc": {Binary: "rustc"}}
+	keep, skipped := manageableTargets(m, targets)
+
+	require.Contains(t, keep, "node", "already-managed shim is re-synced")
+	require.Contains(t, keep, "rustc", "absent tool is installed")
+	require.NotContains(t, keep, "go", "existing system command is not overridden")
+	require.Equal(t, []string{"go"}, skipped)
+}
+
+// TestManageableTargetsSkipsUnmanagedFileInBinDir: an unmanaged file already in
+// the target bin dir (e.g. a real ~/.local/bin/uv) is skipped, not overwritten.
+func TestManageableTargetsSkipsUnmanagedFileInBinDir(t *testing.T) {
+	root := t.TempDir()
+	binDir := filepath.Join(root, "bin")
+	shimDir := filepath.Join(root, "shims")
+	require.NoError(t, os.MkdirAll(binDir, 0700))
+	require.NoError(t, os.MkdirAll(shimDir, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(shimDir, "dproxy-shim"), []byte("#!/bin/sh\n"), 0700))
+	uvPath := filepath.Join(binDir, "uv")
+	require.NoError(t, os.WriteFile(uvPath, []byte("real uv"), 0700))
+
+	prev := pathLookup
+	t.Cleanup(func() { pathLookup = prev })
+	pathLookup = func(name string) (string, error) {
+		if name == "uv" {
+			return uvPath, nil
+		}
+		return "", exec.ErrNotFound
+	}
+
+	m := shim.Manager{BinDir: binDir, ShimDir: shimDir}
+	keep, skipped := manageableTargets(m, map[string]shim.Target{"uv": {Binary: "uv"}})
+	require.Empty(t, keep)
+	require.Equal(t, []string{"uv"}, skipped)
 }
 
 func TestInstallAllWiresBashZshAndFishCompletion(t *testing.T) {

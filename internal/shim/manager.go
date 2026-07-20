@@ -39,6 +39,32 @@ var (
 
 type Target struct{ Binary string }
 type Manager struct{ BinDir, ShimDir, Executable string }
+
+// IsManagedShim reports whether resolved is a dproxy-managed shim: a symlink
+// targeting the dproxy generic shim. Install uses this to distinguish a name
+// that already resolves to one of our own shims (re-sync it) from a name that
+// resolves to an unrelated command (skip it, never override the user's tool).
+func (m Manager) IsManagedShim(resolved string) bool {
+	info, err := os.Lstat(resolved)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		return false
+	}
+	dest, err := os.Readlink(resolved)
+	if err != nil {
+		return false
+	}
+	if !filepath.IsAbs(dest) {
+		dest = filepath.Join(filepath.Dir(resolved), dest)
+	}
+	expected := filepath.Join(m.ShimDir, genericName)
+	got, e1 := filepath.EvalSymlinks(dest)
+	want, e2 := filepath.EvalSymlinks(expected)
+	if e1 != nil || e2 != nil {
+		return filepath.Clean(dest) == filepath.Clean(expected)
+	}
+	return got == want
+}
+
 type ownership struct {
 	Schema                                       int `json:"schema"`
 	Name, Binary, Target, Kind                   string
