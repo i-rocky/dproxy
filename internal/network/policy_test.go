@@ -39,6 +39,21 @@ func TestAllowlistPreservesDomainPortAssociation(t *testing.T) {
 	require.Equal(t, []uint16{443}, p.PortsForDomain("a.example"))
 }
 
+// TestPortsForDomainReturnsDefensiveCopy verifies the returned port slice is a
+// copy, not the policy's backing slice — dataplane.resolve builds pin sets from
+// it and must not be able to mutate the policy.
+func TestPortsForDomainReturnsDefensiveCopy(t *testing.T) {
+	p, err := Allowlist([]string{"a.example:443"})
+	require.NoError(t, err)
+	ports := p.PortsForDomain("a.example")
+	require.Equal(t, []uint16{443}, ports)
+	ports[0] = 0
+	require.Equal(t, []uint16{443}, p.PortsForDomain("a.example"), "mutating the returned slice must not corrupt the policy")
+
+	// A domain not in the policy resolves to no ports (no implicit allow).
+	require.Nil(t, p.PortsForDomain("other.example"))
+}
+
 func TestAllowlistRejectsNumericAndAmbiguousHosts(t *testing.T) {
 	for _, host := range []string{"127.1:443", "2130706433:443", "0x7f000001:443", "[::1]:443", "example..com:443"} {
 		_, err := Allowlist([]string{host})

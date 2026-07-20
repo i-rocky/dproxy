@@ -1,6 +1,9 @@
 package main
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -71,4 +74,73 @@ func TestParseArgs(t *testing.T) {
 		_, _, err := parseArgs([]string{"-min", "notanum", "coverage.out"})
 		require.Error(t, err)
 	})
+	t.Run("unknown flag errors", func(t *testing.T) {
+		_, _, err := parseArgs([]string{"-bogus", "coverage.out"})
+		require.Error(t, err)
+	})
+	t.Run("two profiles errors", func(t *testing.T) {
+		_, _, err := parseArgs([]string{"a.out", "b.out"})
+		require.Error(t, err)
+	})
+	t.Run("nan threshold errors", func(t *testing.T) {
+		_, _, err := parseArgs([]string{"-min", "NaN", "coverage.out"})
+		require.Error(t, err)
+	})
+}
+
+func TestProfileCoverage(t *testing.T) {
+	t.Run("reads and computes from a file", func(t *testing.T) {
+		p := filepath.Join(t.TempDir(), "cov.out")
+		require.NoError(t, os.WriteFile(p, []byte("mode: set\npkg/x.go:1.1,1.5 3 1\npkg/x.go:2.1,2.5 1 0\n"), 0600))
+		pct, err := profileCoverage(p)
+		require.NoError(t, err)
+		require.InDelta(t, 75.0, pct, 0.001) // 3 of 4 statements
+	})
+	t.Run("missing file errors", func(t *testing.T) {
+		_, err := profileCoverage(filepath.Join(t.TempDir(), "absent"))
+		require.Error(t, err)
+	})
+}
+
+// TestMainExitContract exercises the actual CLI the coverage gate runs: the
+// exit code and message for passing, strictly-at-threshold, failing, and
+// unreadable-profile inputs. CI relies on these exit codes.
+func TestMainExitContract(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "covercheck")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build covercheck: %v\n%s", err, out)
+	}
+	writeProfile := func(content string) string {
+		p := filepath.Join(t.TempDir(), "cov.out")
+		require.NoError(t, os.WriteFile(p, []byte(content), 0600))
+		return p
+	}
+	cases := []struct {
+		name     string
+		args     []string
+		wantExit int
+		wantOut  string
+	}{
+		{"above threshold exits 0", []string{writeProfile("mode: set\npkg/x.go:1.1,1.5 4 1\n")}, 0, "is greater than"},
+		{"below threshold exits 1", []string{writeProfile("mode: set\npkg/x.go:1.1,1.5 4 0\n")}, 1, "must be greater than"},
+		// Exactly 50% against -min 50: the gate is strict (must be greater).
+		{"at threshold exits 1 (strict)", []string{"-min", "50", writeProfile("mode: set\npkg/x.go:1.1,1.5 4 1\npkg/y.go:1.1,1.5 4 0\n")}, 1, "must be greater than"},
+		{"missing profile exits 2", []string{filepath.Join(t.TempDir(), "absent")}, 2, ""},
+		{"no arguments exits 2", nil, 2, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out, err := exec.Command(bin, c.args...).CombinedOutput()
+			if c.wantExit == 0 {
+				require.NoError(t, err, "output: %s", out)
+			} else {
+				exit := &exec.ExitError{}
+				require.ErrorAs(t, err, &exit, "output: %s", out)
+				require.Equal(t, c.wantExit, exit.ExitCode(), "output: %s", out)
+			}
+			if c.wantOut != "" {
+				require.Contains(t, string(out), c.wantOut)
+			}
+		})
+	}
 }
