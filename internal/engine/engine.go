@@ -25,6 +25,7 @@ type Resource struct {
 type GatewaySpec struct {
 	Image, PolicyPath, HealthToken     string
 	InternalNetworkID, EgressNetworkID string
+	DNSUpstream                        string
 	Ownership                          Ownership
 	Ports                              []policy.Port
 }

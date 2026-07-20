@@ -34,6 +34,16 @@ type marker struct {
 	Inode  uint64 `json:"inode"`
 }
 
+// PlannedPath returns the managed location without creating or opening it.
+func (m Manager) PlannedPath(projectID, pluginName, tool, compatibility, platform string) (string, error) {
+	keys, err := cacheKeys(projectID, pluginName, tool, compatibility, platform)
+	root := filepath.Clean(m.Root)
+	if err != nil || m.Root == "" || !filepath.IsAbs(root) || root == "/" {
+		return "", ErrUnsafeKey
+	}
+	return filepath.Join(append([]string{root}, keys...)...), nil
+}
+
 func (m Manager) Path(projectID, pluginName, tool, compatibility, platform string) (string, error) {
 	keys, err := cacheKeys(projectID, pluginName, tool, compatibility, platform)
 	if err != nil {

@@ -23,6 +23,25 @@ func response(status int, header http.Header, body string) *http.Response {
 	return &http.Response{StatusCode: status, Header: header, Body: io.NopCloser(strings.NewReader(body))}
 }
 
+func TestRegistryRejectsRedirectsOversizeAndTrailingJSON(t *testing.T) {
+	redirectClient := &http.Client{Transport: roundTripFunc(func(*http.Request) *http.Response {
+		return response(http.StatusFound, http.Header{"Location": {"http://registry.test/downgrade"}}, "")
+	})}
+	_, err := New(redirectClient).Tags(context.Background(), "registry.test/team/tool")
+	require.ErrorContains(t, err, "status 302")
+
+	for name, body := range map[string]string{
+		"oversize":      `{"tags":["` + strings.Repeat("x", maxResponse) + `"]}`,
+		"trailing json": `{"tags":[]} {"tags":[]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(*http.Request) *http.Response { return response(200, nil, body) })}
+			_, err := New(client).Tags(context.Background(), "registry.test/team/tool")
+			require.Error(t, err)
+		})
+	}
+}
+
 func TestRegistryTagsPaginationAndBearerAuthentication(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) *http.Response {
 		if r.URL.Path == "/token" {

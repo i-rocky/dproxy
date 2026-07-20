@@ -142,3 +142,17 @@ func TestDockerIntegrationSIGTERM(t *testing.T) {
 	require.NoError(t, a.Wait())
 	require.Equal(t, 42, code)
 }
+
+func TestDockerIntegrationEnforcesPIDLimit(t *testing.T) {
+	d, p := integrationDocker(t)
+	p.Command = []string{"pids-limit"}
+	code, _, _ := runIntegrationCommand(t, d, p, false)
+	require.Equal(t, 73, code, "fixture must observe process creation denied by the PID limit")
+}
+
+func TestDockerIntegrationEnforcesMemoryLimit(t *testing.T) {
+	d, p := integrationDocker(t)
+	p.Command = []string{"memory-limit"}
+	code, _, _ := runIntegrationCommand(t, d, p, false)
+	require.NotZero(t, code, "allocation fixture must be terminated by the memory limit")
+}

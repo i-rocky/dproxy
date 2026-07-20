@@ -17,6 +17,16 @@ import (
 
 const defaultCleanupTimeout = 10 * time.Second
 
+type PostStartError struct {
+	Status      int
+	StatusKnown bool
+	Err         error
+}
+
+func (e *PostStartError) Error() string                { return e.Err.Error() }
+func (e *PostStartError) Unwrap() error                { return e.Err }
+func (e *PostStartError) PostStartStatus() (int, bool) { return e.Status, e.StatusKnown }
+
 type Dependencies struct {
 	Engine         engine.Engine
 	Network        NetworkManager
@@ -48,6 +58,7 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 	}
 	var resources []engine.Resource
 	var networkSession networkpolicy.RuntimeSession
+	commandStarted, statusKnown := false, false
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer cancel()
@@ -57,6 +68,12 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 		if networkSession != nil {
 			if err := networkSession.Close(cleanupCtx); err != nil && setupErr == nil {
 				setupErr = fmt.Errorf("cleanup network session: %w", err)
+			}
+		}
+		if commandStarted && setupErr != nil {
+			var post *PostStartError
+			if !errors.As(setupErr, &post) {
+				setupErr = &PostStartError{Status: exitCode, StatusKnown: statusKnown, Err: setupErr}
 			}
 		}
 	}()
@@ -79,6 +96,7 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 		return 0, fmt.Errorf("create command: %w", err)
 	}
 	resources = append(resources, command)
+	commandStarted = true
 	if streams.TTY {
 		if streams.MakeRaw == nil {
 			return 0, errors.New("TTY raw-mode support is required")
@@ -97,7 +115,11 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 	if err != nil {
 		return 0, fmt.Errorf("attach command: %w", err)
 	}
-	defer attachment.Close()
+	defer func() {
+		if err := attachment.Close(); err != nil && setupErr == nil {
+			setupErr = fmt.Errorf("close command attachment: %w", err)
+		}
+	}()
 	if streams.TTY {
 		if streams.TerminalSize == nil {
 			return 0, errors.New("TTY size source is required")
@@ -125,6 +147,7 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 	if err != nil {
 		return exitCode, fmt.Errorf("wait for command: %w", err)
 	}
+	statusKnown = true
 	if err = attachment.Wait(); err != nil {
 		return exitCode, fmt.Errorf("relay command output: %w", err)
 	}

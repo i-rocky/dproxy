@@ -20,14 +20,15 @@ import (
 )
 
 type fakeEngine struct {
-	mu            sync.Mutex
-	calls         []string
-	exit          int
-	waitErr       error
-	removeErr     error
-	waitDelay     time.Duration
-	commandPlan   policy.Plan
-	commandTarget string
+	mu                 sync.Mutex
+	calls              []string
+	exit               int
+	waitErr            error
+	removeErr          error
+	waitDelay          time.Duration
+	commandPlan        policy.Plan
+	commandTarget      string
+	attachmentCloseErr error
 }
 
 func (f *fakeEngine) call(s string)                              { f.mu.Lock(); defer f.mu.Unlock(); f.calls = append(f.calls, s) }
@@ -53,7 +54,7 @@ func (f *fakeEngine) StartCommand(_ context.Context, p policy.Plan, target strin
 }
 func (f *fakeEngine) Attach(context.Context, string, engine.IO) (engine.Attachment, error) {
 	f.call("attach-start")
-	return fakeAttachment{}, nil
+	return fakeAttachment{closeErr: f.attachmentCloseErr}, nil
 }
 func (f *fakeEngine) Wait(context.Context, string) (int, error) {
 	f.call("wait")
@@ -87,10 +88,10 @@ func (f recordingEngine) RemoveContainer(ctx context.Context, r engine.Resource)
 	return f.removeErr
 }
 
-type fakeAttachment struct{}
+type fakeAttachment struct{ closeErr error }
 
-func (fakeAttachment) Wait() error  { return nil }
-func (fakeAttachment) Close() error { return nil }
+func (fakeAttachment) Wait() error    { return nil }
+func (a fakeAttachment) Close() error { return a.closeErr }
 
 type fakeNetworkSession struct {
 	id, gateway string
@@ -166,6 +167,26 @@ func TestRunRestoresTTYAndReportsCleanupFailure(t *testing.T) {
 	require.Zero(t, code)
 	require.ErrorContains(t, err, "cleanup")
 	require.True(t, restored)
+}
+
+func TestRunPreservesKnownCommandStatusOnCleanupFailure(t *testing.T) {
+	f := &fakeEngine{exit: 37, removeErr: errors.New("remove failed")}
+	code, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Network: fakeNetworkManager{&f.calls}}, runtimePlan("none"), testIO())
+	require.Equal(t, 37, code)
+	var post *PostStartError
+	require.ErrorAs(t, err, &post)
+	status, known := post.PostStartStatus()
+	require.True(t, known)
+	require.Equal(t, 37, status)
+}
+
+func TestRunPreservesKnownCommandStatusOnAttachmentCloseFailure(t *testing.T) {
+	f := &fakeEngine{exit: 37, attachmentCloseErr: errors.New("close failed")}
+	code, err := Run(context.Background(), Dependencies{Engine: recordingEngine{f}, Network: fakeNetworkManager{&f.calls}}, runtimePlan("none"), testIO())
+	require.Equal(t, 37, code)
+	var post *PostStartError
+	require.ErrorAs(t, err, &post)
+	require.True(t, post.StatusKnown)
 }
 
 func TestRunRejectsTTYWithoutRawModeAndStillCleans(t *testing.T) {

@@ -30,6 +30,7 @@ func New(client *http.Client) *Registry {
 	if copy.Timeout == 0 {
 		copy.Timeout = 20 * time.Second
 	}
+	copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Registry{client: &copy}
 }
 
@@ -208,7 +209,19 @@ func validateResponse(resp *http.Response, err error) (*http.Response, error) {
 }
 func decode(resp *http.Response, target any) error {
 	defer resp.Body.Close()
-	return json.NewDecoder(io.LimitReader(resp.Body, maxResponse+1)).Decode(target)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponse+1))
+	if err != nil || len(body) > maxResponse {
+		return errors.New("invalid registry JSON response")
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	if err := decoder.Decode(target); err != nil {
+		return errors.New("invalid registry JSON response")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("invalid trailing registry JSON")
+	}
+	return nil
 }
 func readManifest(resp *http.Response) ([]byte, string, string, error) {
 	defer resp.Body.Close()

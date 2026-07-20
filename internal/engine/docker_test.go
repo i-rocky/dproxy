@@ -237,7 +237,7 @@ func TestDockerStartsOnlyGatewayWithNarrowNetworkCapability(t *testing.T) {
 	require.NoError(t, os.WriteFile(policyPath, []byte(`{"mode":"public"}`), 0400))
 	api := &fakeDockerAPI{}
 	ownership := Ownership{"project", "invocation"}
-	r, err := NewDocker(api).StartGateway(context.Background(), GatewaySpec{Image: "repo/gateway@sha256:" + strings.Repeat("a", 64), PolicyPath: policyPath, HealthToken: "token", InternalNetworkID: "internal", EgressNetworkID: "bridge", Ownership: ownership, Ports: []policy.Port{{Host: 3000, Container: 8080}}})
+	r, err := NewDocker(api).StartGateway(context.Background(), GatewaySpec{Image: "repo/gateway@sha256:" + strings.Repeat("a", 64), PolicyPath: policyPath, HealthToken: "token", InternalNetworkID: "internal", EgressNetworkID: "bridge", DNSUpstream: "11.77.0.10:53", Ownership: ownership, Ports: []policy.Port{{Host: 3000, Container: 8080}}})
 	require.NoError(t, err)
 	require.Equal(t, GatewayRole, r.Role)
 	require.True(t, api.started)
@@ -248,9 +248,19 @@ func TestDockerStartsOnlyGatewayWithNarrowNetworkCapability(t *testing.T) {
 	require.True(t, api.lastHost.ReadonlyRootfs)
 	require.True(t, api.lastHost.Mounts[0].ReadOnly)
 	require.Equal(t, "3000", api.lastHost.PortBindings["8080/tcp"][0].HostPort)
+	require.Contains(t, api.lastConfig.Env, "DPROXY_DNS_UPSTREAM=11.77.0.10:53")
 	api.containerLabels = resourceLabels(r)
 	require.NoError(t, NewDocker(api).GatewayHealth(context.Background(), r, "token"))
 	require.Equal(t, []string{"/gateway", "health"}, api.execOptions.Cmd)
+}
+
+func TestDockerRejectsUnsafeGatewayDNSUpstream(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := dir + "/policy.json"
+	require.NoError(t, os.WriteFile(policyPath, []byte(`{"mode":"public"}`), 0400))
+	spec := GatewaySpec{Image: "repo/gateway@sha256:" + strings.Repeat("a", 64), PolicyPath: policyPath, HealthToken: "token", InternalNetworkID: "internal", EgressNetworkID: "bridge", DNSUpstream: "dns.example:53", Ownership: Ownership{"project", "invocation"}}
+	_, err := NewDocker(&fakeDockerAPI{}).StartGateway(context.Background(), spec)
+	require.ErrorContains(t, err, "DNS upstream")
 }
 
 func TestDockerCommandSharesGatewayNetworkNamespaceWithoutCapabilities(t *testing.T) {

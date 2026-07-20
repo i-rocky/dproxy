@@ -53,24 +53,40 @@ type Store struct {
 }
 
 func NewStore(root string, git Git) (*Store, error) {
+	return openStore(root, git, true)
+}
+
+// OpenStore opens existing plugin metadata without creating filesystem state.
+func OpenStore(root string, git Git) (*Store, error) {
+	return openStore(root, git, false)
+}
+
+func openStore(root string, git Git, create bool) (*Store, error) {
 	if git == nil {
 		git = execGit{}
 	}
-	if err := os.MkdirAll(filepath.Join(root, "repos"), 0o700); err != nil {
-		return nil, fault.New("open plugin store", "create failed", err)
-	}
-	if err := syncDirectory(root); err != nil {
-		return nil, fault.New("open plugin store", "root sync failed", err)
-	}
-	if err := syncDirectory(filepath.Join(root, "repos")); err != nil {
-		return nil, fault.New("open plugin store", "repositories sync failed", err)
-	}
-	if err := os.Chmod(root, 0o700); err != nil {
-		return nil, fault.New("open plugin store", "permissions failed", err)
-	}
 	home := filepath.Join(root, "git-home")
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		return nil, fault.New("open plugin store", "Git home failed", err)
+	if !create {
+		info, err := os.Stat(root)
+		if err != nil || !info.IsDir() {
+			return nil, ErrNotFound
+		}
+	} else {
+		if err := os.MkdirAll(filepath.Join(root, "repos"), 0o700); err != nil {
+			return nil, fault.New("open plugin store", "create failed", err)
+		}
+		if err := syncDirectory(root); err != nil {
+			return nil, fault.New("open plugin store", "root sync failed", err)
+		}
+		if err := syncDirectory(filepath.Join(root, "repos")); err != nil {
+			return nil, fault.New("open plugin store", "repositories sync failed", err)
+		}
+		if err := os.Chmod(root, 0o700); err != nil {
+			return nil, fault.New("open plugin store", "permissions failed", err)
+		}
+		if err := os.MkdirAll(home, 0o700); err != nil {
+			return nil, fault.New("open plugin store", "Git home failed", err)
+		}
 	}
 	s := &Store{root: root, git: git, index: storeIndex{Schema: 1}}
 	s.renameIndex = os.Rename
