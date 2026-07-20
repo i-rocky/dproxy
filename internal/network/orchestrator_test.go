@@ -60,6 +60,15 @@ func TestStartBuildsMandatoryPolicyAndEngineSubnetsInternally(t *testing.T) {
 	require.Contains(t, e.gatewayPolicy.DeniedPrefixes, "203.0.114.0/24")
 	require.NoError(t, s.Close(context.Background()))
 }
+
+func TestBeginIsPublicEntryAndShortCircuitsNoneMode(t *testing.T) {
+	req := publicRequest()
+	req.Plan.Network.Mode = "none"
+	s, err := NewOrchestrator(&fakeEngine{}).Begin(context.Background(), req)
+	require.NoError(t, err)
+	require.NotEmpty(t, s.InvocationID())
+	require.NoError(t, s.Close(context.Background()))
+}
 func TestAllowlistStartBuildsEndpointsFromPlanIntent(t *testing.T) {
 	e := &fakeEngine{}
 	r := publicRequest()

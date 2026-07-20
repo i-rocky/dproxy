@@ -10,9 +10,9 @@ import (
 func TestComputeCoverage(t *testing.T) {
 	t.Run("counts covered statement blocks", func(t *testing.T) {
 		profile := "mode: set\n" +
-			"pkg/a.go:10.1,10.5 2 1\n" +   // covered
-			"pkg/a.go:20.1,20.5 3 0\n" +   // uncovered
-			"pkg/b.go:5.1,5.5 5 1\n"       // covered
+			"pkg/a.go:10.1,10.5 2 1\n" + // covered
+			"pkg/a.go:20.1,20.5 3 0\n" + // uncovered
+			"pkg/b.go:5.1,5.5 5 1\n" // covered
 		pct, err := computeCoverage(strings.NewReader(profile))
 		require.NoError(t, err)
 		// covered = 2 + 5 = 7 of 10 total -> 70%
@@ -34,6 +34,20 @@ func TestComputeCoverage(t *testing.T) {
 		pct, err := computeCoverage(strings.NewReader("mode: set\nnot a line\npkg/x.go:1.1,1.5 4 1\n"))
 		require.NoError(t, err)
 		require.InDelta(t, 100.0, pct, 0.001)
+	})
+
+	t.Run("deduplicates blocks reported by multiple test binaries", func(t *testing.T) {
+		// Mirrors -coverpkg output: the same block appears once per test binary,
+		// covered by only some of them. The block is covered iff any count > 0.
+		profile := "mode: set\n" +
+			"pkg/a.go:10.1,10.5 2 1\n" + // covered by binary A
+			"pkg/a.go:10.1,10.5 2 0\n" + // not covered by binary B
+			"pkg/a.go:20.1,20.5 3 0\n" + // never covered
+			"pkg/a.go:20.1,20.5 3 0\n"
+		pct, err := computeCoverage(strings.NewReader(profile))
+		require.NoError(t, err)
+		// 2 distinct blocks: one covered (2 stmts), one not (3 stmts) -> 2/5 = 40%
+		require.InDelta(t, 40.0, pct, 0.001)
 	})
 }
 

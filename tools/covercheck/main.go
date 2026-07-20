@@ -77,8 +77,17 @@ func profileCoverage(path string) (float64, error) {
 // and returns the percentage of covered statements. Each data line is
 // "file:start.line.col,end.line.col numStmts count"; a statement block is
 // covered when count > 0.
+//
+// A block may appear more than once — notably with "go test -coverpkg=./...",
+// every test binary reports every block, so a covered block still has many
+// zero-count duplicate lines. Blocks are deduplicated by location; a block is
+// covered when any of its duplicate lines reports count > 0.
 func computeCoverage(r io.Reader) (float64, error) {
-	var covered, total int64
+	type block struct {
+		numStmts int64
+		covered  bool
+	}
+	blocks := map[string]*block{}
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -94,16 +103,27 @@ func computeCoverage(r io.Reader) (float64, error) {
 		if err1 != nil || err2 != nil || numStmts < 0 {
 			continue
 		}
-		total += numStmts
+		b, ok := blocks[parts[0]]
+		if !ok {
+			b = &block{numStmts: numStmts}
+			blocks[parts[0]] = b
+		}
 		if count > 0 {
-			covered += numStmts
+			b.covered = true
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return 0, fmt.Errorf("read coverage profile: %w", err)
 	}
-	if total == 0 {
+	if len(blocks) == 0 {
 		return 0, fmt.Errorf("coverage profile has no statements")
+	}
+	var covered, total int64
+	for _, b := range blocks {
+		total += b.numStmts
+		if b.covered {
+			covered += b.numStmts
+		}
 	}
 	return float64(covered) / float64(total) * 100, nil
 }

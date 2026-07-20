@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"strings"
 	"syscall"
@@ -45,6 +46,8 @@ type fakeDockerAPI struct {
 	killedSignal    string
 	execOptions     container.ExecOptions
 	execExit        int
+	networks        []network.Summary
+	networkListErr  error
 }
 
 func (f *fakeDockerAPI) Info(context.Context) (system.Info, error)            { return f.info, nil }
@@ -109,6 +112,9 @@ func (f *fakeDockerAPI) NetworkRemove(_ context.Context, id string) error {
 }
 func (f *fakeDockerAPI) ContainerList(context.Context, container.ListOptions) ([]types.Container, error) {
 	return f.listed, nil
+}
+func (f *fakeDockerAPI) NetworkList(context.Context, network.ListOptions) ([]network.Summary, error) {
+	return f.networks, f.networkListErr
 }
 func (f *fakeDockerAPI) ContainerExecCreate(_ context.Context, _ string, o container.ExecOptions) (types.IDResponse, error) {
 	f.execOptions = o
@@ -380,6 +386,66 @@ func TestWaitIgnoresClosedErrorChannel(t *testing.T) {
 	code, err := NewDocker(closedWaitAPI{}).Wait(context.Background(), "command")
 	require.NoError(t, err)
 	require.Equal(t, 29, code)
+}
+
+type errorWaitAPI struct{}
+
+func (errorWaitAPI) ContainerWait(context.Context, string, container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+	errs := make(chan error, 1)
+	errs <- errors.New("container died")
+	return nil, errs
+}
+
+type blockingWaitAPI struct{}
+
+func (blockingWaitAPI) ContainerWait(context.Context, string, container.WaitCondition) (<-chan container.WaitResponse, <-chan error) {
+	return make(chan container.WaitResponse), make(chan error)
+}
+
+func TestWaitPropagatesContainerErrorAndCancellation(t *testing.T) {
+	_, err := NewDocker(errorWaitAPI{}).Wait(context.Background(), "command")
+	require.Error(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	_, err = NewDocker(blockingWaitAPI{}).Wait(ctx, "command")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestActiveDockerSubnetsMasksActiveNetworks(t *testing.T) {
+	api := &fakeDockerAPI{networks: []network.Summary{{IPAM: network.IPAM{Config: []network.IPAMConfig{{Subnet: "172.20.0.0/16"}}}}}}
+	got, err := NewDocker(api).ActiveDockerSubnets(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []netip.Prefix{netip.MustParsePrefix("172.20.0.0/16")}, got)
+
+	_, err = NewDocker(&fakeDockerAPI{networks: []network.Summary{{IPAM: network.IPAM{Config: []network.IPAMConfig{{Subnet: "not-a-subnet"}}}}}}).ActiveDockerSubnets(context.Background())
+	require.Error(t, err)
+
+	got, err = NewDocker(&fakeDockerAPI{networks: []network.Summary{{IPAM: network.IPAM{Config: []network.IPAMConfig{{Subnet: ""}}}}}}).ActiveDockerSubnets(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	_, err = NewDocker(&fakeDockerAPI{networkListErr: errors.New("boom")}).ActiveDockerSubnets(context.Background())
+	require.Error(t, err)
+}
+
+func TestResizeRejectsInvalidTerminal(t *testing.T) {
+	d := NewDocker(&fakeDockerAPI{})
+	require.Error(t, d.Resize(context.Background(), "", 40, 120))
+	require.Error(t, d.Resize(context.Background(), "command", 0, 120))
+	require.Error(t, d.Resize(context.Background(), "command", 40, 0))
+}
+
+func TestGatewayHealthRejectsInvalidRequests(t *testing.T) {
+	r := Resource{ID: "gateway", Ownership: Ownership{"project", "invocation"}, Role: GatewayRole}
+	d := NewDocker(&fakeDockerAPI{})
+	require.Error(t, d.GatewayHealth(context.Background(), r, ""))                                                                       // empty token
+	require.Error(t, d.GatewayHealth(context.Background(), Resource{ID: "gateway", Ownership: r.Ownership, Role: CommandRole}, "token")) // wrong role
+
+	require.Error(t, NewDocker(&fakeDockerAPI{inspectErr: errors.New("unreachable"), containerLabels: resourceLabels(r)}).GatewayHealth(context.Background(), r, "token")) // inspect failure
+
+	forged := &fakeDockerAPI{containerLabels: map[string]string{ManagedLabel: "true", ProjectLabel: "other", InvocationLabel: "invocation", RoleLabel: GatewayRole}}
+	require.Error(t, NewDocker(forged).GatewayHealth(context.Background(), r, "token")) // label mismatch
 }
 
 func resourceLabels(r Resource) map[string]string {

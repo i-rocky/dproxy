@@ -83,6 +83,16 @@ func TestInstallDetectsShellFromEnv(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestReplaceRcBlockAppendsNewlineToContentWithoutOne(t *testing.T) {
+	rcPath := filepath.Join(t.TempDir(), ".bashrc")
+	require.NoError(t, os.WriteFile(rcPath, []byte("# no trailing newline"), 0600))
+	require.NoError(t, replaceRcBlock(rcPath, rcBlock("$HOME/.local/bin", `"$X/dproxy.bash"`)))
+	data, err := os.ReadFile(rcPath)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "# no trailing newline\n")
+	require.Equal(t, 1, strings.Count(string(data), dproxyBlockBegin))
+}
+
 func mustTargetShells(t *testing.T, args []string) []string {
 	t.Helper()
 	shells, err := targetShells(args)

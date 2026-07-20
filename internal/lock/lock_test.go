@@ -133,6 +133,25 @@ func TestGlobalConfigHashVerifies(t *testing.T) {
 	require.Error(t, f.Verify(HashConfig([]byte("schema=1\n")), platform))
 }
 
+func TestCanonicalHTTPSRepository(t *testing.T) {
+	require.True(t, canonicalHTTPSRepository("https://example.com/repo"))
+	for _, bad := range []string{"http://example.com/repo", "https://example.com/", "https://example.com/repo?x=1", "https://user:pass@example.com/repo", "https://example.com:443/repo", "https://Example.com/repo", "ftp://example.com/repo"} {
+		require.False(t, canonicalHTTPSRepository(bad), bad)
+	}
+}
+
+func TestLockFormatValidators(t *testing.T) {
+	require.True(t, ValidExactVersion("1.2.3"))
+	require.True(t, ValidExactVersion("1.2.3-rc.1+build"))
+	for _, bad := range []string{"", "1", "v1.2.3", "1.2", "1.2.3.4"} {
+		require.False(t, ValidExactVersion(bad), bad)
+	}
+	require.True(t, ValidDigest("sha256:"+strings.Repeat("a", 64)))
+	require.False(t, ValidDigest("sha256:short"))
+	require.True(t, ValidSHA256(strings.Repeat("a", 64)))
+	require.False(t, ValidSHA256(strings.Repeat("a", 63)))
+}
+
 func TestLoadRejectsUnknownOrTrailingData(t *testing.T) {
 	for _, raw := range []string{`{"schema":1,"unknown":true}`, `{"schema":1}{}`} {
 		path := filepath.Join(t.TempDir(), "lock")

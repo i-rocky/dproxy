@@ -95,6 +95,31 @@ func TestManifestAcceptsEgress(t *testing.T) {
 	require.Equal(t, []int{443, 80}, manifest.Egress[0].Ports)
 }
 
+func TestValidEgressHostAcceptsAndRejects(t *testing.T) {
+	for _, ok := range []string{"registry.npmjs.org", "files.pythonhosted.org", "a.b.c.example"} {
+		require.True(t, validEgressHost(ok), ok)
+	}
+	for _, bad := range []string{"", "no-dot", "10.0.0.1", "127.1", "0x7f.1", "a..b", "-bad.example", strings.Repeat("a.", 127) + "x"} {
+		require.False(t, validEgressHost(bad), bad)
+	}
+}
+
+func TestValidImageRepositoryPorts(t *testing.T) {
+	require.True(t, validImageRepository("registry.example:5000/x"))
+	for _, bad := range []string{"registry.example:70000/x", "registry.example:abc/x", "registry.example:0500/x"} {
+		require.False(t, validImageRepository(bad), bad)
+	}
+}
+
+func TestValidTagTemplate(t *testing.T) {
+	for _, ok := range []string{"{version}", "{version}-alpine", "v{version}"} {
+		require.True(t, validTagTemplate(ok), ok)
+	}
+	for _, bad := range []string{"latest", "{version}{version}", "{{version}}", "{version}{}", "-{version}", ".*"} {
+		require.False(t, validTagTemplate(bad), bad)
+	}
+}
+
 func TestValidateRejectsProgrammaticManifestMutation(t *testing.T) {
 	manifest, err := LoadManifest(strings.NewReader("schema=1\nname=\"x\"\nbins=[\"x\"]\ncommands={x=[\"x\"]}\n[images.default]\nrepository=\"registry.example/x\"\ntag_template=\"{version}\"\n"))
 	require.NoError(t, err)

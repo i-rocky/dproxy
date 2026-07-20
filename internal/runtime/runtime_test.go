@@ -88,6 +88,20 @@ func (f recordingEngine) RemoveContainer(ctx context.Context, r engine.Resource)
 	return f.removeErr
 }
 
+type resizeFailingEngine struct{ *fakeEngine }
+
+func (resizeFailingEngine) Resize(context.Context, engine.ContainerID, uint, uint) error {
+	return errors.New("docker unreachable")
+}
+
+func TestResizeSurfacesTerminalAndEngineErrors(t *testing.T) {
+	err := resize(context.Background(), &fakeEngine{}, "cmd", func() (uint, uint, error) { return 0, 0, errors.New("no tty") })
+	require.ErrorContains(t, err, "query terminal size")
+
+	err = resize(context.Background(), resizeFailingEngine{&fakeEngine{}}, "cmd", func() (uint, uint, error) { return 40, 120, nil })
+	require.ErrorContains(t, err, "resize command terminal")
+}
+
 type fakeAttachment struct{ closeErr error }
 
 func (fakeAttachment) Wait() error    { return nil }

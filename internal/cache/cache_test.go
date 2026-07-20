@@ -32,6 +32,19 @@ func TestCacheRejectsTraversal(t *testing.T) {
 	require.ErrorIs(t, err, ErrUnsafeKey)
 }
 
+func TestPlannedPathComputesWithoutCreatingState(t *testing.T) {
+	m := newCache(t)
+	got, err := m.PlannedPath("project", "node", "npm", "24", "linux-amd64")
+	require.NoError(t, err)
+	require.Contains(t, got, m.Root)
+	_, err = os.Stat(filepath.Join(m.Root, ownerFile))
+	require.ErrorIs(t, err, os.ErrNotExist) // no ownership marker written
+	_, err = newCache(t).PlannedPath("project", "node", "../escape", "24", "linux-amd64")
+	require.ErrorIs(t, err, ErrUnsafeKey)
+	_, err = Manager{Root: ""}.PlannedPath("project", "node", "npm", "24", "linux-amd64")
+	require.ErrorIs(t, err, ErrUnsafeKey)
+}
+
 func TestCacheRejectsEmptyAndAbsoluteKeys(t *testing.T) {
 	m := newCache(t)
 	for _, key := range []string{"", "/tmp", "two/parts", "white space", ".."} {

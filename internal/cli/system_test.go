@@ -157,6 +157,22 @@ func filesystemSnapshot(t *testing.T, root string) map[string]string {
 	return result
 }
 
+func TestPlanCommandSupportsReadOnlyCachePlanning(t *testing.T) {
+	runner := systemRunner{}
+	planned, err := runner.PlanCommand(context.Background(), "cache", []string{"list"})
+	require.NoError(t, err)
+	require.Contains(t, planned, "cache list")
+	planned, err = runner.PlanCommand(context.Background(), "cache", []string{"prune", "--all"})
+	require.NoError(t, err)
+	require.Contains(t, planned, "prune")
+	_, err = runner.PlanCommand(context.Background(), "cache", []string{"bogus"})
+	require.Error(t, err)
+	_, err = runner.PlanCommand(context.Background(), "cache", nil)
+	require.Error(t, err)
+	_, err = runner.PlanCommand(context.Background(), "init", nil)
+	require.Error(t, err)
+}
+
 func TestGlobalAutoLockResolvesThenReuses(t *testing.T) {
 	systemEnvironment(t)
 	writeUserConfig(t)
