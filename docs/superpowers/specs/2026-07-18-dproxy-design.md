@@ -52,7 +52,15 @@ User state follows XDG locations, with equivalent fallbacks where an XDG variabl
 ~/.local/bin/<managed tool symlinks>
 ```
 
-The first release supports Linux hosts with Docker Engine. Podman and Docker Desktop compatibility may be added only after their isolation behavior passes the same security integration suite; they are not silently treated as equivalent.
+Dproxy targets Linux, macOS, and Windows from day one. It is not a phased
+release: the product is "all or nothing" across operating systems. Today the
+verified implementation runs on Linux with Docker Engine; the macOS (PF) and
+Windows (WFP) gateway backends and the non-Linux filesystem-ownership backends
+are tracked same-release work in `docs/platform-backends.md`, not a future
+version. An OS is only treated as supported once its backends pass the same
+security integration suite; until then the CLI fails closed on unsupported OSes.
+Docker Desktop and Podman are not silently treated as equivalent to Docker
+Engine — their isolation behavior must pass the same suite before use.
 
 ## Container Execution
 
@@ -85,6 +93,20 @@ Network modes are:
 - `public`: traffic is routed through a trusted filtering gateway that permits public destinations and denies host and protected networks.
 - `allowlist`: the gateway permits only configured domains and ports, while applying all `public` protections.
 
+A tool's plugin manifest declares the registry fronts it needs (for example
+`npm`→npmjs.org, `pip`→pypi.org, `cargo`→crates.io). Manifest egress is a floor:
+whenever the gateway runs, the effective allowlist is the union of the tool's
+manifest egress and any user-declared entries, so a tool can always reach its
+own registry and the user may widen but never narrow below the floor. When a
+project leaves the network mode unset (the default for frictionless use),
+dproxy derives an allowlist from the invoked tool's manifest egress rather than
+falling back to open access. Registry fronts commonly sit behind shared CDNs
+(npmjs behind Cloudflare/Fastly, PyPI behind Fastly), so domain allowlisting
+narrows but does not fully eliminate exfiltration: a malicious install step can
+still reach any origin co-hosted on a permitted CDN. DNS-answer pinning and the
+deny-first firewall tighten this further, but the residual CDN channel is a
+known, accepted limit rather than a complete seal.
+
 Ordinary unfiltered Docker bridge networking is not available through persistent project or plugin policy. Any future diagnostic escape hatch must be an explicit, conspicuous command-line action.
 
 For `public` and `allowlist`, dproxy creates a unique internal Docker network. The command container attaches only to that network. A digest-pinned dproxy gateway container attaches to both the internal network and an outbound network. Both containers use `--rm`; the network is removed after execution.
@@ -104,6 +126,7 @@ Plugins are versioned TOML manifests fetched from Git. They declare:
 - Container entrypoint and typed argument mapping.
 - Cache locations and compatibility keys.
 - Safe fixed environment defaults.
+- Registry egress: the host:port fronts a tool may reach from the sandbox.
 - Compatibility and platform metadata.
 
 Plugins cannot contain executable hooks, shell fragments, arbitrary Docker arguments, arbitrary mounts, environment passthrough, host namespaces, devices, privileged mode, added capabilities, or security overrides.
@@ -186,6 +209,31 @@ If gateway setup or any isolation control fails, dproxy fails closed and never f
 Errors identify whether failure came from dproxy setup or the proxied command. Container command failures preserve their exit code. Targeted diagnostics cover missing configuration, stale locks, unknown shims, path collisions, unsupported platforms, unavailable engines, gateway failures, digest mismatches, and stale managed resources.
 
 `--explain` reports the resolved provider, image digest, mounts, environment names, network policy, ports, and command. `--dry-run` emits the planned operation without starting containers. Sensitive values are redacted.
+
+## Platform Backends
+
+Two subsystems are inherently kernel-coupled and are isolated behind per-OS
+backends so dproxy can target Linux, macOS, and Windows without weakening core
+policy:
+
+1. **Gateway dataplane** — transparent DNS/TCP/UDP interception and the
+   deny-first firewall. The Linux backend is `nftables`; macOS requires a PF
+   backend and Windows a WFP backend. Each backend must reproduce the audited
+   `BuildRulePlan` ordering and pass the same attestation and adversarial tests.
+2. **Hardened filesystem ownership** — the crash-safe, symlink-resistant
+   transactions that protect shim, cache, project identity, and plugin state.
+   The Linux backend uses `openat2`/`RESOLVE_BENEATH`/`renameat2`; macOS and
+   Windows need ownership models that preserve the same no-symlink,
+   verify-before-mutate guarantees without those Linux primitives.
+
+Container user identity is also platform-specific: Linux and Docker-Desktop-on-Linux
+match the host UID/GID to produce correctly owned files; Windows has no
+UID/GID model and Docker Desktop (macOS/Windows) runs containers in a Linux VM
+whose host↔container UID mapping and network topology differ from native Linux.
+These differences are characterized per-OS rather than treated as equivalent.
+
+The concrete work items, acceptance criteria, and current compile-time blockers
+for the macOS and Windows backends live in `docs/platform-backends.md`.
 
 ## Implementation Stack
 
