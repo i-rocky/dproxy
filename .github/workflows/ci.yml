@@ -25,7 +25,10 @@ jobs:
       - run: go test -race ./...
       - name: coverage gate (>80%, cross-package)
         run: |
-          go test -coverpkg=./... -coverprofile=coverage.out ./... >/dev/null
+          # -count=1 disables the test cache so the cross-package coverage
+          # profile is assembled from one fresh run of every test binary; mixing
+          # cached and fresh binaries under -coverpkg produces an incomplete profile.
+          go test -count=1 -coverpkg=./... -coverprofile=coverage.out ./... >/dev/null
           go run ./tools/covercheck coverage.out
 
   integration:
