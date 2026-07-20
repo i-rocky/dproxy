@@ -53,7 +53,7 @@ func TestGatewayLiveDataplaneAllowsControlledPublicAndDeniesPrivate(t *testing.T
 	require.NoError(t, err)
 	raw, err := json.Marshal(gatewayPolicy)
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(policyPath, raw, 0400))
+	require.NoError(t, os.WriteFile(policyPath, raw, 0444))
 	de := engine.NewDocker(api)
 	ownership := engine.Ownership{ProjectID: "gateway-dataplane", InvocationID: fmt.Sprintf("gateway-%d", time.Now().UnixNano())}
 	gateway, err := de.StartGateway(ctx, engine.GatewaySpec{Image: gatewayImage, PolicyPath: policyPath, HealthToken: "integration-health", InternalNetworkID: internalNet, EgressNetworkID: publicNet, DNSUpstream: "11.77.0.10:53", Ownership: ownership})
@@ -100,18 +100,20 @@ func TestGatewayLiveDataplaneAllowsControlledPublicAndDeniesPrivate(t *testing.T
 func createIPv6FixtureNetwork(t *testing.T, ctx context.Context, api *client.Client, subnet string) string {
 	t.Helper()
 	enabled := true
-	created, err := api.NetworkCreate(ctx, fmt.Sprintf("dproxy-fixture-v6-%d", time.Now().UnixNano()), network.CreateOptions{EnableIPv6: &enabled, IPAM: &network.IPAM{Config: []network.IPAMConfig{{Subnet: subnet}}}})
+	name := fmt.Sprintf("dproxy-fixture-v6-%d", time.Now().UnixNano())
+	created, err := api.NetworkCreate(ctx, name, network.CreateOptions{EnableIPv6: &enabled, IPAM: &network.IPAM{Config: []network.IPAMConfig{{Subnet: subnet}}}})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, api.NetworkRemove(context.Background(), created.ID)) })
-	return created.ID
+	return name
 }
 
 func createFixtureNetwork(t *testing.T, ctx context.Context, api *client.Client, subnet string) string {
 	t.Helper()
-	created, err := api.NetworkCreate(ctx, fmt.Sprintf("dproxy-fixture-%d", time.Now().UnixNano()), network.CreateOptions{IPAM: &network.IPAM{Config: []network.IPAMConfig{{Subnet: subnet}}}})
+	name := fmt.Sprintf("dproxy-fixture-%d", time.Now().UnixNano())
+	created, err := api.NetworkCreate(ctx, name, network.CreateOptions{IPAM: &network.IPAM{Config: []network.IPAMConfig{{Subnet: subnet}}}})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, api.NetworkRemove(context.Background(), created.ID)) })
-	return created.ID
+	return name
 }
 
 func startFixtureServer(t *testing.T, ctx context.Context, api *client.Client, image, networkID string) string {

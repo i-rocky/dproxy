@@ -87,13 +87,14 @@ func TestProductionExecuteRunsModeNoneAndDeniesHostState(t *testing.T) {
 
 func hostProcMarker(t *testing.T) []byte {
 	t.Helper()
-	raw, err := os.ReadFile("/proc/1/environ")
-	require.NoError(t, err)
-	for _, entry := range bytes.Split(raw, []byte{0}) {
-		if len(entry) > 8 && !bytes.HasPrefix(entry, []byte("PATH=")) {
-			return entry
+	// A host-environment value that must not appear in the sandbox. Reading the
+	// host's /proc/1/environ is not reliably permitted (ptrace_scope), so use
+	// the live host environment, which serves the same leak-detection purpose.
+	for _, entry := range os.Environ() {
+		if len(entry) > 8 && !strings.HasPrefix(entry, "PATH=") && !strings.HasPrefix(entry, "XDG_") && !strings.HasPrefix(entry, "HOME=") {
+			return []byte(entry)
 		}
 	}
-	t.Fatal("host PID 1 environment has no marker")
+	t.Fatal("host environment has no marker")
 	return nil
 }
