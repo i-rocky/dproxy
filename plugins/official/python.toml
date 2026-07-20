@@ -2,11 +2,12 @@ schema = 1
 name = "python"
 bins = ["python", "python3", "pip", "uv"]
 commands = { python = ["python"], python3 = ["python3"], pip = ["pip"], uv = ["uv"] }
+environment = { PIP_CACHE_DIR = "/var/dproxy/pip" }
 [images.default]
 repository = "docker.io/library/python"
 tag_template = "{version}"
 [[caches]]
-path = "/root/.cache"
+path = "/var/dproxy/pip"
 compatibility = "minor"
 [[egress]]
 host = "pypi.org"

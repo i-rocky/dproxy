@@ -2,11 +2,12 @@ schema = 1
 name = "node"
 bins = ["node", "npm", "npx"]
 commands = { node = ["node"], npm = ["npm"], npx = ["npx"] }
+environment = { npm_config_cache = "/var/dproxy/node" }
 [images.default]
 repository = "docker.io/library/node"
 tag_template = "{version}"
 [[caches]]
-path = "/home/node/.npm"
+path = "/var/dproxy/node"
 compatibility = "major"
 [[egress]]
 host = "registry.npmjs.org"

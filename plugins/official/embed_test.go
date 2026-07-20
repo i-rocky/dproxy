@@ -1,9 +1,11 @@
 package official
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
+	"github.com/i-rocky/dproxy/internal/plugin"
 	"github.com/stretchr/testify/require"
 )
 
@@ -62,6 +64,36 @@ func TestDeriveProvenanceFromBuildInfo(t *testing.T) {
 	require.Equal(t, "", commitFromPseudoVersion("v1.2.3"), "a real tag is not a pseudo-version")
 	require.Equal(t, "https://github.com/i-rocky/dproxy", repositoryFromModule("github.com/i-rocky/dproxy"))
 	require.Equal(t, "", repositoryFromModule("example/local"), "non-host module path yields no repository")
+}
+
+// TestOfficialManifestsWireCacheEnvironment locks the contract that each bundled
+// tool is configured (via its own cache-home env var) to write into its mounted
+// cache. The sandbox overrides HOME, so without this wiring the tools would
+// write to an ephemeral path and re-download every run.
+func TestOfficialManifestsWireCacheEnvironment(t *testing.T) {
+	cacheEnv := map[string]string{
+		"node":   "npm_config_cache",
+		"python": "PIP_CACHE_DIR",
+		"rust":   "CARGO_HOME",
+		"go":     "GOPATH",
+		"bun":    "BUN_INSTALL",
+	}
+	entries, err := manifests.ReadDir(".")
+	require.NoError(t, err)
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".toml") {
+			continue
+		}
+		raw, err := manifests.ReadFile(entry.Name())
+		require.NoError(t, err)
+		m, err := plugin.LoadManifest(bytes.NewReader(raw))
+		require.NoError(t, err)
+		envVar, ok := cacheEnv[m.Name]
+		require.True(t, ok, "no cache-env mapping for plugin %q", m.Name)
+		require.Len(t, m.Caches, 1, m.Name)
+		require.Equal(t, m.Caches[0].Path, m.Environment[envVar],
+			"%s: %s must point at the cache mount so the tool actually uses it", m.Name, envVar)
+	}
 }
 
 // TestBinariesEnumeratesUniqueTools confirms shim enumeration yields each bundled

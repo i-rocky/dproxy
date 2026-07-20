@@ -2,11 +2,12 @@ schema = 1
 name = "go"
 bins = ["go", "gofmt"]
 commands = { go = ["go"], gofmt = ["gofmt"] }
+environment = { GOPATH = "/var/dproxy/go" }
 [images.default]
 repository = "docker.io/library/golang"
 tag_template = "{version}"
 [[caches]]
-path = "/go/pkg/mod"
+path = "/var/dproxy/go"
 compatibility = "minor"
 [[egress]]
 host = "proxy.golang.org"

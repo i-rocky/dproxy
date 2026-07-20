@@ -2,11 +2,12 @@ schema = 1
 name = "rust"
 bins = ["cargo", "rustc", "rustfmt"]
 commands = { cargo = ["cargo"], rustc = ["rustc"], rustfmt = ["rustfmt"] }
+environment = { CARGO_HOME = "/var/dproxy/cargo" }
 [images.default]
 repository = "docker.io/library/rust"
 tag_template = "{version}"
 [[caches]]
-path = "/usr/local/cargo/registry"
+path = "/var/dproxy/cargo"
 compatibility = "minor"
 [[egress]]
 host = "index.crates.io"

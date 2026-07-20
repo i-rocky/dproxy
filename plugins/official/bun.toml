@@ -2,11 +2,12 @@ schema = 1
 name = "bun"
 bins = ["bun", "bunx"]
 commands = { bun = ["bun"], bunx = ["bunx"] }
+environment = { BUN_INSTALL = "/var/dproxy/bun" }
 [images.default]
 repository = "docker.io/oven/bun"
 tag_template = "{version}"
 [[caches]]
-path = "/home/bun/.bun/install/cache"
+path = "/var/dproxy/bun"
 compatibility = "major"
 [[egress]]
 host = "registry.npmjs.org"
