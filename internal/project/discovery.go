@@ -24,6 +24,52 @@ type Project struct {
 }
 
 func Find(start string) (Project, error) {
+	return find(start, true)
+}
+
+// FindReadOnly discovers an initialized project without creating its identity.
+func FindReadOnly(start string) (Project, error) {
+	return find(start, false)
+}
+
+// FindOrGlobal discovers a project by walking up from start. If no project is
+// found it returns a synthetic global project rooted at start whose stable
+// identity lives under globalDir, so tools run outside any project still get a
+// sandboxed, auto-locked execution path instead of a hard failure.
+func FindOrGlobal(start, globalDir string) (Project, error) {
+	p, err := Find(start)
+	if err == nil {
+		return p, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return Project{}, err
+	}
+	return globalProject(start, globalDir)
+}
+
+// globalProject materializes the global default project: the current directory
+// becomes /workspace and a stable identity is loaded or created under globalDir.
+func globalProject(start, globalDir string) (Project, error) {
+	root, err := filepath.Abs(start)
+	if err != nil {
+		return Project{}, fmt.Errorf("resolve global project root: %w", err)
+	}
+	if err := os.MkdirAll(globalDir, 0700); err != nil {
+		return Project{}, fmt.Errorf("create global project state: %w", err)
+	}
+	fd, err := unix.Open(filepath.Clean(globalDir), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return Project{}, fmt.Errorf("open global project state: %w", err)
+	}
+	defer unix.Close(fd)
+	id, err := loadOrCreateIDAt(fd)
+	if err != nil {
+		return Project{}, err
+	}
+	return Project{Root: root, RelativeWorkdir: ".", ID: id}, nil
+}
+
+func find(start string, createIdentity bool) (Project, error) {
 	startPath, err := filepath.Abs(start)
 	if err != nil {
 		return Project{}, fmt.Errorf("resolve start directory: %w", err)
@@ -53,7 +99,7 @@ func Find(start string) (Project, error) {
 			if pathErr != nil {
 				return Project{}, pathErr
 			}
-			return loadProjectAt(root, workdir, currentFD)
+			return loadProjectAtMode(root, workdir, currentFD, createIdentity)
 		}
 		if configErr != unix.ENOENT {
 			if configErr == unix.ELOOP {
@@ -111,11 +157,25 @@ func loadProject(root, workdir string) (Project, error) {
 }
 
 func loadProjectAt(root, workdir string, rootFD int) (Project, error) {
+	return loadProjectAtMode(root, workdir, rootFD, true)
+}
+
+func loadProjectAtMode(root, workdir string, rootFD int, createIdentity bool) (Project, error) {
 	rel, err := filepath.Rel(root, workdir)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
 		return Project{}, errors.New("working directory is outside project root")
 	}
-	id, err := loadOrCreateID(rootFD)
+	var id string
+	if createIdentity {
+		id, err = loadOrCreateID(rootFD)
+	} else {
+		metadataFD, openErr := unix.Openat(rootFD, ".dproxy", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if openErr != nil {
+			return Project{}, errors.New("project identity is not initialized; run dproxy init")
+		}
+		id, err = readIDAt(metadataFD)
+		unix.Close(metadataFD)
+	}
 	if err != nil {
 		return Project{}, err
 	}

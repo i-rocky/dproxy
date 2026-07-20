@@ -61,6 +61,17 @@ var syncParent = func(parent string) error {
 
 func HashConfig(raw []byte) string { sum := sha256.Sum256(raw); return hex.EncodeToString(sum[:]) }
 
+var globalConfigHashValue = func() string {
+	sum := sha256.Sum256([]byte("dproxy-global-default"))
+	return hex.EncodeToString(sum[:])
+}()
+
+// GlobalConfigHash is the sentinel configuration hash for the global default
+// project, which has no .dproxy.toml. Per-tool global locks are pinned to this
+// constant so they verify without a real project configuration file while
+// still requiring immutable digests and provenance.
+func GlobalConfigHash() string { return globalConfigHashValue }
+
 func (f File) Verify(configSHA256, platform string) error {
 	if f.Schema != 1 || !shaPattern.MatchString(f.ConfigSHA256) || f.ConfigSHA256 != configSHA256 || !platformPattern.MatchString(platform) {
 		return errors.New("lock metadata is invalid or stale")

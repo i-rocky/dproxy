@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -54,7 +55,8 @@ func TestSystemAdministrativeProjectAndCacheFlow(t *testing.T) {
 	require.NoError(t, runner.Command(context.Background(), "tool", []string{"remove", "node"}, streams))
 	require.Error(t, runner.Command(context.Background(), "tool", []string{"remove", "node"}, streams))
 	require.NoError(t, runner.Command(context.Background(), "cache", []string{"list"}, streams))
-	require.NoError(t, runner.Command(context.Background(), "cache", []string{"prune"}, streams))
+	require.ErrorContains(t, runner.Command(context.Background(), "cache", []string{"prune"}, streams), "--all")
+	require.NoError(t, runner.Command(context.Background(), "cache", []string{"prune", "--all"}, streams))
 	require.Error(t, runner.Command(context.Background(), "cache", []string{"clean"}, streams))
 }
 
@@ -102,6 +104,135 @@ func TestSystemLockAndResolveWithImmutableOfficialProvider(t *testing.T) {
 	require.NoError(t, (systemRunner{}).Command(context.Background(), "setup", nil, Streams{Stdout: &output, Stderr: &output}))
 	require.Contains(t, output.String(), "managed tool shims")
 	require.NoError(t, (systemRunner{}).Command(context.Background(), "uninstall", nil, Streams{}))
+}
+
+func TestProductionExecuteDryRunLeavesFilesystemUnchanged(t *testing.T) {
+	root := systemEnvironment(t)
+	writeUserConfig(t)
+	require.NoError(t, initProject(nil))
+	require.NoError(t, toolCommand([]string{"add", "node", "24"}))
+	oldRepo, oldCommit := official.OfficialRepository, official.Commit
+	official.OfficialRepository, official.Commit = "https://github.com/example/dproxy.git", strings.Repeat("b", 40)
+	t.Cleanup(func() { official.OfficialRepository, official.Commit = oldRepo, oldCommit })
+	oldResolve := registryResolve
+	registryResolve = func(_ context.Context, cfg config.Config, manifests map[string]plugin.Manifest, platform, hash string) (lock.File, error) {
+		manifest := manifests["node"]
+		return lock.File{Schema: 1, ConfigSHA256: hash, Plugins: map[string]lock.Plugin{manifest.Name: {Repository: manifest.Provenance.Repository, Commit: manifest.Provenance.Commit, ManifestSHA256: manifest.Provenance.ManifestSHA256, Schema: 1}}, Tools: map[string]lock.Tool{"node": {Requested: cfg.Tools["node"], Version: "24.1.0", Image: "registry.test/node", Tag: "24.1.0", Digest: "sha256:" + strings.Repeat("c", 64), Platform: platform}}}, nil
+	}
+	t.Cleanup(func() { registryResolve = oldResolve })
+	require.NoError(t, resolveLock(context.Background(), nil))
+	before := filesystemSnapshot(t, root)
+	var output bytes.Buffer
+	require.Equal(t, 0, Execute(context.Background(), "dproxy", []string{"--dry-run", "node", "--version"}, &output, &output), output.String())
+	require.Equal(t, 0, Execute(context.Background(), "dproxy", []string{"--dry-run", "cache", "prune", "--all"}, &output, &output), output.String())
+	require.Equal(t, before, filesystemSnapshot(t, root))
+}
+
+func filesystemSnapshot(t *testing.T, root string) map[string]string {
+	t.Helper()
+	result := map[string]string{}
+	require.NoError(t, filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		value := fmt.Sprintf("%s:%o", info.Mode().Type(), info.Mode().Perm())
+		if info.Mode().IsRegular() {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			value += ":" + string(data)
+		}
+		result[rel] = value
+		return nil
+	}))
+	return result
+}
+
+func TestGlobalAutoLockResolvesThenReuses(t *testing.T) {
+	systemEnvironment(t)
+	writeUserConfig(t)
+	oldRepo, oldCommit := official.OfficialRepository, official.Commit
+	official.OfficialRepository, official.Commit = "https://github.com/example/dproxy.git", strings.Repeat("b", 40)
+	t.Cleanup(func() { official.OfficialRepository, official.Commit = oldRepo, oldCommit })
+
+	var resolveCalls int
+	oldResolve := registryResolve
+	registryResolve = func(_ context.Context, cfg config.Config, manifests map[string]plugin.Manifest, platform, hash string) (lock.File, error) {
+		resolveCalls++
+		require.Equal(t, lock.GlobalConfigHash(), hash)
+		manifest := manifests["node"]
+		return lock.File{Schema: 1, ConfigSHA256: hash, Plugins: map[string]lock.Plugin{manifest.Name: {Repository: manifest.Provenance.Repository, Commit: manifest.Provenance.Commit, ManifestSHA256: manifest.Provenance.ManifestSHA256, Schema: 1}}, Tools: map[string]lock.Tool{"node": {Requested: cfg.Tools["node"], Version: "24.1.0", Image: "registry.test/node", Tag: "24.1.0", Digest: "sha256:" + strings.Repeat("c", 64), Platform: platform}}}, nil
+	}
+	t.Cleanup(func() { registryResolve = oldResolve })
+
+	runner := systemRunner{}
+	plan, err := runner.Resolve(context.Background(), "npm", []string{"ci"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"npm", "ci"}, plan.Command)
+	require.Equal(t, "allowlist", plan.Network.Mode)
+	require.Contains(t, plan.Network.Allowlist, "registry.npmjs.org:443")
+	require.Equal(t, 1, resolveCalls)
+
+	// Second invocation reuses the persisted per-tool global lock (no resolution).
+	_, err = runner.Resolve(context.Background(), "npm", []string{"install"})
+	require.NoError(t, err)
+	require.Equal(t, 1, resolveCalls)
+
+	_, err = os.Stat(filepath.Join(os.Getenv("XDG_DATA_HOME"), "dproxy", "global-project", "node.lock.json"))
+	require.NoError(t, err)
+}
+
+func TestGlobalAutoLockReadOnlyDoesNotPersist(t *testing.T) {
+	systemEnvironment(t)
+	writeUserConfig(t)
+	oldRepo, oldCommit := official.OfficialRepository, official.Commit
+	official.OfficialRepository, official.Commit = "https://github.com/example/dproxy.git", strings.Repeat("b", 40)
+	t.Cleanup(func() { official.OfficialRepository, official.Commit = oldRepo, oldCommit })
+	var resolveCalls int
+	oldResolve := registryResolve
+	registryResolve = func(_ context.Context, cfg config.Config, manifests map[string]plugin.Manifest, platform, hash string) (lock.File, error) {
+		resolveCalls++
+		manifest := manifests["node"]
+		return lock.File{Schema: 1, ConfigSHA256: hash, Plugins: map[string]lock.Plugin{manifest.Name: {Repository: manifest.Provenance.Repository, Commit: manifest.Provenance.Commit, ManifestSHA256: manifest.Provenance.ManifestSHA256, Schema: 1}}, Tools: map[string]lock.Tool{"node": {Requested: cfg.Tools["node"], Version: "24.1.0", Image: "registry.test/node", Tag: "24.1.0", Digest: "sha256:" + strings.Repeat("c", 64), Platform: platform}}}, nil
+	}
+	t.Cleanup(func() { registryResolve = oldResolve })
+
+	runner := systemRunner{}
+	plan, err := runner.ResolveReadOnly(context.Background(), "npm", []string{"ci"})
+	require.NoError(t, err)
+	require.Equal(t, "allowlist", plan.Network.Mode)
+	require.Equal(t, 1, resolveCalls)
+	_, err = os.Stat(filepath.Join(os.Getenv("XDG_DATA_HOME"), "dproxy", "global-project", "node.lock.json"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestResolveGlobalManifest(t *testing.T) {
+	_, _, dataRoot, err := userRoots()
+	require.NoError(t, err)
+	// Dev build: no official provenance and no community plugins -> failure.
+	_, err = resolveGlobalManifest("node", dataRoot)
+	require.Error(t, err)
+
+	oldRepo, oldCommit := official.OfficialRepository, official.Commit
+	official.OfficialRepository, official.Commit = "https://github.com/example/dproxy.git", strings.Repeat("b", 40)
+	t.Cleanup(func() { official.OfficialRepository, official.Commit = oldRepo, oldCommit })
+
+	manifest, err := resolveGlobalManifest("npm", dataRoot)
+	require.NoError(t, err)
+	require.Equal(t, "node", manifest.Name)
+	require.NotEmpty(t, manifest.Egress)
+
+	_, err = resolveGlobalManifest("never-a-tool", dataRoot)
+	require.Error(t, err)
 }
 
 func TestSystemRunUsesInjectedExecutionBoundary(t *testing.T) {
@@ -221,7 +352,7 @@ func TestSystemUsageFailures(t *testing.T) {
 	for _, args := range [][]string{{"remove"}, {"sync"}, {"list", "extra"}, {"inspect"}, {"wat"}} {
 		require.Error(t, pluginCommand(context.Background(), args, streams), args)
 	}
-	for _, args := range [][]string{{"list", "extra"}, {"prune", "extra"}, {"wat"}} {
+	for _, args := range [][]string{{"list", "extra"}, {"prune"}, {"prune", "extra"}, {"wat"}} {
 		require.Error(t, cacheCommand(args, streams), args)
 	}
 }

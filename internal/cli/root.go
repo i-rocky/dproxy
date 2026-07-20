@@ -7,11 +7,30 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"dproxy/internal/diagnostic"
 	"dproxy/internal/policy"
 )
+
+// supportedOSes lists the host operating systems dproxy currently runs on.
+// Expanding this set requires the per-OS backends described in
+// docs/platform-backends.md (gateway dataplane and hardened filesystem
+// ownership) to land with passing security tests. It is a variable so tests
+// can exercise the unsupported-OS path.
+var supportedOSes = map[string]struct{}{"linux": {}}
+
+// currentOS is the host OS used for the startup guard. It is a variable so
+// tests can exercise the fail-closed path without changing build settings.
+var currentOS = runtime.GOOS
+
+func assertSupportedRuntime(goos string) error {
+	if _, ok := supportedOSes[goos]; ok {
+		return nil
+	}
+	return fmt.Errorf("dproxy does not yet run on %q; only linux is supported today (see docs/platform-backends.md)", goos)
+}
 
 var ErrSandboxCreation = errors.New("sandbox creation failed")
 
@@ -26,6 +45,14 @@ type Runner interface {
 	Command(context.Context, string, []string, Streams) error
 }
 
+type readOnlyResolver interface {
+	ResolveReadOnly(context.Context, string, []string) (policy.Plan, error)
+}
+
+type administrativePlanner interface {
+	PlanCommand(context.Context, string, []string) (string, error)
+}
+
 type Dependencies struct {
 	Runner         Runner
 	Stdin          io.Reader
@@ -38,6 +65,10 @@ func Execute(ctx context.Context, argv0 string, args []string, stdout, stderr io
 
 func ExecuteWithDeps(ctx context.Context, argv0 string, args []string, deps Dependencies) int {
 	streams := normalizeStreams(deps)
+	if err := assertSupportedRuntime(currentOS); err != nil {
+		fmt.Fprintln(streams.Stderr, "dproxy:", err)
+		return 2
+	}
 	if deps.Runner == nil {
 		fmt.Fprintln(streams.Stderr, "dproxy: execution dependencies are unavailable")
 		return 2
@@ -74,8 +105,20 @@ parsed:
 		return 0
 	}
 	if isAdmin(args[0]) {
-		if dryRun || explain {
+		if explain {
 			return usage(streams, "planning flags require a tool")
+		}
+		if dryRun {
+			planner, ok := runner.(administrativePlanner)
+			if !ok {
+				return usage(streams, "administrative dry-run is unavailable")
+			}
+			planned, err := planner.PlanCommand(ctx, args[0], args[1:])
+			if err != nil {
+				return reportError(streams, err)
+			}
+			fmt.Fprintf(streams.Stdout, "dry-run: %s\n", planned)
+			return 0
 		}
 		if err := runner.Command(ctx, args[0], args[1:], streams); err != nil {
 			return reportError(streams, err)
@@ -89,7 +132,17 @@ func executeTool(ctx context.Context, binary string, args []string, dryRun, expl
 	if binary == "" || strings.ContainsAny(binary, `/\\`) {
 		return usage(streams, "invalid tool name")
 	}
-	plan, err := runner.Resolve(ctx, binary, args)
+	var plan policy.Plan
+	var err error
+	if dryRun || explain {
+		if resolver, ok := runner.(readOnlyResolver); ok {
+			plan, err = resolver.ResolveReadOnly(ctx, binary, args)
+		} else {
+			plan, err = runner.Resolve(ctx, binary, args)
+		}
+	} else {
+		plan, err = runner.Resolve(ctx, binary, args)
+	}
 	if err != nil {
 		return reportError(streams, err)
 	}
@@ -100,6 +153,15 @@ func executeTool(ctx context.Context, binary string, args []string, dryRun, expl
 	}
 	code, err := runner.Run(ctx, plan, streams)
 	if err != nil {
+		var post interface{ PostStartStatus() (int, bool) }
+		if errors.As(err, &post) {
+			status, known := post.PostStartStatus()
+			fmt.Fprintf(streams.Stderr, "dproxy: warning: %v\n", err)
+			if known {
+				return status
+			}
+			return 125
+		}
 		return reportError(streams, err)
 	}
 	return code
@@ -131,7 +193,7 @@ func usage(s Streams, message string) int { fmt.Fprintln(s.Stderr, message); ret
 
 func isAdmin(name string) bool {
 	switch name {
-	case "init", "lock", "update", "tool", "plugin", "setup", "doctor", "cache", "uninstall":
+	case "init", "lock", "update", "tool", "plugin", "setup", "install", "doctor", "cache", "uninstall":
 		return true
 	default:
 		return false

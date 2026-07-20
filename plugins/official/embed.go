@@ -55,3 +55,36 @@ func Load() (map[string]plugin.Manifest, error) {
 	}
 	return result, nil
 }
+
+// Binaries enumerates the binary names provided by the bundled official
+// manifests without requiring release provenance. Shims only point at the
+// dproxy binary; provenance is enforced when a tool is resolved and locked, so
+// enumeration for shim installation is safe without immutable release metadata.
+func Binaries() ([]string, error) {
+	entries, err := manifests.ReadDir(".")
+	if err != nil {
+		return nil, err
+	}
+	var bins []string
+	seen := map[string]struct{}{}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".toml") {
+			continue
+		}
+		raw, err := manifests.ReadFile(entry.Name())
+		if err != nil {
+			return nil, err
+		}
+		manifest, err := plugin.LoadManifest(bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		for _, binary := range manifest.Bins {
+			if _, ok := seen[binary]; !ok {
+				seen[binary] = struct{}{}
+				bins = append(bins, binary)
+			}
+		}
+	}
+	return bins, nil
+}

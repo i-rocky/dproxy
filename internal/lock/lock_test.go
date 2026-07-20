@@ -125,6 +125,14 @@ func TestHashConfig(t *testing.T) {
 	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte("config"))), got)
 }
 
+func TestGlobalConfigHashVerifies(t *testing.T) {
+	platform := "linux/amd64"
+	f := File{Schema: 1, ConfigSHA256: GlobalConfigHash(), Plugins: map[string]Plugin{"node": {Repository: "https://example.test/plugins", Commit: strings.Repeat("b", 40), ManifestSHA256: strings.Repeat("c", 64), Schema: 1}}, Tools: map[string]Tool{"node": {Requested: "*", Version: "24.1.0", Image: "registry.test/node", Tag: "24.1.0", Digest: "sha256:" + strings.Repeat("d", 64), Platform: platform}}}
+	require.NoError(t, f.Verify(GlobalConfigHash(), platform))
+	// A project config hash must not satisfy a global (no-project) lock.
+	require.Error(t, f.Verify(HashConfig([]byte("schema=1\n")), platform))
+}
+
 func TestLoadRejectsUnknownOrTrailingData(t *testing.T) {
 	for _, raw := range []string{`{"schema":1,"unknown":true}`, `{"schema":1}{}`} {
 		path := filepath.Join(t.TempDir(), "lock")

@@ -34,6 +34,21 @@ type systemRunner struct{}
 
 func newSystemRunner() Runner { return systemRunner{} }
 
+func (systemRunner) PlanCommand(_ context.Context, name string, args []string) (string, error) {
+	switch name {
+	case "cache":
+		if len(args) == 2 && args[0] == "prune" && args[1] == "--all" {
+			return "cache prune --all (would remove every managed project cache)", nil
+		}
+		if len(args) == 1 && args[0] == "list" {
+			return "cache list (read-only)", nil
+		}
+		return "", errors.New("usage: dproxy --dry-run cache list|prune --all")
+	default:
+		return "", fmt.Errorf("dry-run is not supported for administrative command %q", name)
+	}
+}
+
 type systemState struct {
 	project                                  project.Project
 	config                                   config.Config
@@ -44,8 +59,16 @@ type systemState struct {
 	platform, cacheRoot, stateRoot, dataRoot string
 }
 
-func (systemRunner) Resolve(_ context.Context, binary string, args []string) (policy.Plan, error) {
-	state, err := loadSystemState(binary)
+func (systemRunner) Resolve(ctx context.Context, binary string, args []string) (policy.Plan, error) {
+	return resolveSystemPlan(ctx, binary, args, false)
+}
+
+func (systemRunner) ResolveReadOnly(ctx context.Context, binary string, args []string) (policy.Plan, error) {
+	return resolveSystemPlan(ctx, binary, args, true)
+}
+
+func resolveSystemPlan(ctx context.Context, binary string, args []string, readOnly bool) (policy.Plan, error) {
+	state, err := loadSystemState(ctx, binary, readOnly)
 	if err != nil {
 		return policy.Plan{}, err
 	}
@@ -65,13 +88,18 @@ func (systemRunner) Resolve(_ context.Context, binary string, args []string) (po
 	manager := cache.Manager{Root: state.cacheRoot}
 	for _, declaration := range state.manifest.Caches {
 		compatibility := compatibility(tool.Version, declaration.Compatibility)
-		path, err := manager.Path(state.project.ID, state.manifest.Name, binary, compatibility, strings.ReplaceAll(state.platform, "/", "-"))
+		var path string
+		if readOnly {
+			path, err = manager.PlannedPath(state.project.ID, state.manifest.Name, binary, compatibility, strings.ReplaceAll(state.platform, "/", "-"))
+		} else {
+			path, err = manager.Path(state.project.ID, state.manifest.Name, binary, compatibility, strings.ReplaceAll(state.platform, "/", "-"))
+		}
 		if err != nil {
 			return policy.Plan{}, err
 		}
 		cachePaths[declaration.Path] = path
 	}
-	return policy.Build(policy.Input{InvocationID: "planning", ProjectID: state.project.ID, ProjectRoot: state.project.Root, RelativeWorkdir: state.project.RelativeWorkdir, CacheRoot: state.cacheRoot, Platform: state.platform, Binary: binary, CachePaths: cachePaths, Arguments: args, UID: os.Getuid(), GID: os.Getgid(), Tool: tool, Manifest: state.manifest, Sandbox: state.config.Sandbox})
+	return policy.Build(policy.Input{InvocationID: "planning", ProjectID: state.project.ID, ProjectRoot: state.project.Root, RelativeWorkdir: state.project.RelativeWorkdir, CacheRoot: state.cacheRoot, Platform: state.platform, Binary: binary, CachePaths: cachePaths, Arguments: args, UID: os.Getuid(), GID: os.Getgid(), Tool: tool, Manifest: state.manifest, Sandbox: state.config.Sandbox, ReadOnlyPlanning: readOnly})
 }
 
 func (systemRunner) Run(ctx context.Context, plan policy.Plan, streams Streams) (int, error) {
@@ -81,6 +109,11 @@ func (systemRunner) Run(ctx context.Context, plan policy.Plan, streams Streams) 
 var systemExecute = executeSystemPlan
 
 func executeSystemPlan(ctx context.Context, plan policy.Plan, streams Streams) (int, error) {
+	mappedImage, err := systemImageReferenceMapper(plan.Image)
+	if err != nil {
+		return 0, err
+	}
+	plan.Image = mappedImage
 	user, _, runtimeStateRoot, _, err := loadUserState()
 	if err != nil {
 		return 0, err
@@ -106,12 +139,17 @@ func executeSystemPlan(ctx context.Context, plan policy.Plan, streams Streams) (
 	}
 	code, runErr := systemRuntimeRun(ctx, commandruntime.Dependencies{Engine: de, Network: orchestrator, NetworkRequest: network.Request{GatewayImage: user.GatewayImage, EgressNetworkID: "bridge", StateDir: filepath.Join(runtimeStateRoot, "network")}}, plan, runtimeStreams)
 	if runErr != nil {
+		var post *commandruntime.PostStartError
+		if errors.As(runErr, &post) {
+			return code, runErr
+		}
 		return code, fmt.Errorf("%w: %v", ErrSandboxCreation, runErr)
 	}
 	return code, nil
 }
 
 var systemRuntimeRun = commandruntime.Run
+var systemImageReferenceMapper = func(reference string) (string, error) { return reference, nil }
 var systemRuntimeFactory = func(user config.UserConfig) (engine.Engine, commandruntime.NetworkManager, error) {
 	api, err := dockerAPI(user)
 	if err != nil {
@@ -135,6 +173,8 @@ func (systemRunner) Command(ctx context.Context, name string, args []string, str
 		return pluginCommand(ctx, args, streams)
 	case "setup":
 		return setupCommand(streams)
+	case "install":
+		return installCommand(args, streams)
 	case "doctor":
 		return doctorCommand(ctx, streams)
 	case "cache":
@@ -158,7 +198,7 @@ func initProject(args []string) error {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	if err := config.WriteAtomic(".dproxy.toml", config.Config{Schema: 1, Tools: map[string]string{}, Sandbox: config.Sandbox{Network: "none"}}); err != nil {
+	if err := config.WriteAtomic(".dproxy.toml", config.Config{Schema: 1, Tools: map[string]string{}, Sandbox: config.Sandbox{}}); err != nil {
 		return err
 	}
 	_, err := project.Find(".")
@@ -383,7 +423,7 @@ func cacheCommand(args []string, streams Streams) error {
 		return err
 	}
 	if len(args) == 0 {
-		return errors.New("usage: dproxy cache list|clean|prune")
+		return errors.New("usage: dproxy cache list|clean|prune --all")
 	}
 	switch args[0] {
 	case "list":
@@ -404,8 +444,8 @@ func cacheCommand(args []string, streams Streams) error {
 		}
 		return nil
 	case "prune":
-		if len(args) != 1 {
-			return errors.New("usage: dproxy cache prune")
+		if len(args) != 2 || args[1] != "--all" {
+			return errors.New("usage: dproxy cache prune --all (removes every managed project cache)")
 		}
 		return (cache.Manager{Root: cacheRoot}).Prune(map[string]struct{}{})
 	case "clean":
@@ -418,7 +458,7 @@ func cacheCommand(args []string, streams Streams) error {
 		}
 		return (cache.Manager{Root: cacheRoot}).Clean(p.ID, args[1], args[2], args[3], strings.ReplaceAll(runtime.GOOS+"/"+runtime.GOARCH, "/", "-"))
 	default:
-		return errors.New("usage: dproxy cache list|clean|prune")
+		return errors.New("usage: dproxy cache list|clean|prune --all")
 	}
 }
 
@@ -476,10 +516,13 @@ func uninstallCommand() error {
 	return nil
 }
 
-func loadSystemState(binary string) (systemState, error) {
-	p, err := project.Find(".")
-	if err != nil {
-		return systemState{}, fmt.Errorf("discover project: %w", err)
+func loadSystemState(ctx context.Context, binary string, readOnly bool) (systemState, error) {
+	p, findErr := findProject(".", readOnly)
+	if errors.Is(findErr, project.ErrNotFound) {
+		return loadGlobalSystemState(ctx, binary, readOnly)
+	}
+	if findErr != nil {
+		return systemState{}, fmt.Errorf("discover project: %w", findErr)
 	}
 	configPath := filepath.Join(p.Root, ".dproxy.toml")
 	raw, err := os.ReadFile(configPath)
@@ -502,11 +545,21 @@ func loadSystemState(binary string) (systemState, error) {
 	if err := locked.Verify(lock.HashConfig(raw), platform); err != nil {
 		return systemState{}, fmt.Errorf("verify lock (run dproxy lock): %w", err)
 	}
-	store, err := plugin.NewStore(filepath.Join(dataRoot, "plugins"), nil)
-	if err != nil {
+	var store *plugin.Store
+	if readOnly {
+		store, err = plugin.OpenStore(filepath.Join(dataRoot, "plugins"), nil)
+	} else {
+		store, err = plugin.NewStore(filepath.Join(dataRoot, "plugins"), nil)
+	}
+	if err != nil && !readOnly {
 		return systemState{}, err
 	}
-	manifest, err := store.Resolve(binary)
+	var manifest plugin.Manifest
+	if store != nil {
+		manifest, err = store.Resolve(binary)
+	} else {
+		err = plugin.ErrNotFound
+	}
 	if err != nil {
 		bundled, bundleErr := official.Load()
 		if bundleErr == nil {
@@ -525,20 +578,112 @@ func loadSystemState(binary string) (systemState, error) {
 	return systemState{project: p, config: cfg, user: user, store: store, manifest: manifest, locked: locked, platform: platform, cacheRoot: cacheRoot, stateRoot: stateRoot, dataRoot: dataRoot}, nil
 }
 
+func findProject(start string, readOnly bool) (project.Project, error) {
+	if readOnly {
+		return project.FindReadOnly(start)
+	}
+	return project.Find(start)
+}
+
+// loadGlobalSystemState serves tool invocations issued outside any project.
+// It materializes a global default project (so the current directory becomes
+// /workspace), auto-locks the requested tool by immutable digest on first use,
+// and reuses the per-tool global lock on subsequent runs.
+func loadGlobalSystemState(ctx context.Context, binary string, readOnly bool) (systemState, error) {
+	cacheRoot, stateRoot, dataRoot, err := userRoots()
+	if err != nil {
+		return systemState{}, err
+	}
+	// Resolve the manifest before requiring user configuration so a typo fails
+	// fast and offline instead of demanding a gateway image.
+	manifest, err := resolveGlobalManifest(binary, dataRoot)
+	if err != nil {
+		return systemState{}, err
+	}
+	user, err := loadUserConfig()
+	if err != nil {
+		return systemState{}, err
+	}
+	platform := runtime.GOOS + "/" + runtime.GOARCH
+	globalDir := filepath.Join(dataRoot, "global-project")
+	p, err := project.FindOrGlobal(".", globalDir)
+	if err != nil {
+		return systemState{}, fmt.Errorf("discover global project: %w", err)
+	}
+	locked, lockErr := loadGlobalLock(ctx, globalDir, manifest, platform, readOnly)
+	if lockErr != nil {
+		return systemState{}, lockErr
+	}
+	return systemState{project: p, config: config.Config{Schema: 1, Sandbox: config.Sandbox{}}, user: user, manifest: manifest, locked: locked, platform: platform, cacheRoot: cacheRoot, stateRoot: stateRoot, dataRoot: dataRoot}, nil
+}
+
+// loadGlobalLock returns a verified per-tool global lock, resolving and
+// persisting it on first use (or when stale). Resolution happens on the host
+// and needs registry network access; the result is pinned by digest.
+func loadGlobalLock(ctx context.Context, globalDir string, manifest plugin.Manifest, platform string, readOnly bool) (lock.File, error) {
+	lockPath := filepath.Join(globalDir, manifest.Name+".lock.json")
+	locked, lockErr := lock.Load(lockPath)
+	if lockErr == nil {
+		if verifyErr := locked.Verify(lock.GlobalConfigHash(), platform); verifyErr != nil {
+			lockErr = verifyErr
+		}
+	}
+	if lockErr != nil {
+		resolved, resolveErr := registryResolve(ctx, config.Config{Schema: 1, Tools: map[string]string{manifest.Name: "*"}}, map[string]plugin.Manifest{manifest.Name: manifest}, platform, lock.GlobalConfigHash())
+		if resolveErr != nil {
+			return lock.File{}, fmt.Errorf("auto-lock tool %q: %w", manifest.Name, resolveErr)
+		}
+		if !readOnly {
+			if writeErr := lock.WriteAtomic(lockPath, resolved); writeErr != nil {
+				return lock.File{}, fmt.Errorf("persist global lock: %w", writeErr)
+			}
+		}
+		return resolved, nil
+	}
+	return locked, nil
+}
+
+// resolveGlobalManifest resolves a tool manifest from the trusted plugin store,
+// falling back to the bundled official plugins (release builds only).
+func resolveGlobalManifest(binary, dataRoot string) (plugin.Manifest, error) {
+	if store, storeErr := plugin.OpenStore(filepath.Join(dataRoot, "plugins"), nil); storeErr == nil {
+		if manifest, err := store.Resolve(binary); err == nil {
+			return manifest, nil
+		}
+	}
+	bundled, bundleErr := official.Load()
+	if bundleErr != nil {
+		return plugin.Manifest{}, fmt.Errorf("resolve provider for %q: %w", binary, plugin.ErrNotFound)
+	}
+	manifest, found := bundled[binary]
+	if !found {
+		return plugin.Manifest{}, fmt.Errorf("resolve provider for %q: %w", binary, plugin.ErrNotFound)
+	}
+	return manifest, nil
+}
+
 func loadUserState() (config.UserConfig, string, string, string, error) {
 	cacheRoot, stateRoot, dataRoot, err := userRoots()
 	if err != nil {
 		return config.UserConfig{}, "", "", "", err
 	}
-	configRoot, err := os.UserConfigDir()
+	user, err := loadUserConfig()
 	if err != nil {
 		return config.UserConfig{}, "", "", "", err
 	}
+	return user, cacheRoot, stateRoot, dataRoot, nil
+}
+
+func loadUserConfig() (config.UserConfig, error) {
+	configRoot, err := os.UserConfigDir()
+	if err != nil {
+		return config.UserConfig{}, err
+	}
 	user, err := config.LoadUser(filepath.Join(configRoot, "dproxy", "config.toml"))
 	if err != nil {
-		return config.UserConfig{}, "", "", "", fmt.Errorf("load user configuration (set a pinned gateway image): %w", err)
+		return config.UserConfig{}, fmt.Errorf("load user configuration (set a pinned gateway image): %w", err)
 	}
-	return user, cacheRoot, stateRoot, dataRoot, nil
+	return user, nil
 }
 
 func userRoots() (string, string, string, error) {

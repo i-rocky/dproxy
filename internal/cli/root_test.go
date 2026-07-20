@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"dproxy/internal/policy"
+	commandruntime "dproxy/internal/runtime"
 	"github.com/stretchr/testify/require"
 )
 
@@ -17,6 +18,14 @@ type fakeRunner struct {
 	runCode        int
 	runErr         error
 	mutations      int
+}
+
+func TestKnownPostStartWarningReturnsExactCommandStatus(t *testing.T) {
+	f := &fakeRunner{runCode: 37, runErr: &commandruntime.PostStartError{Status: 37, StatusKnown: true, Err: errors.New("cleanup failed")}}
+	var stderr bytes.Buffer
+	code := ExecuteWithDeps(context.Background(), "dproxy", []string{"npm"}, Dependencies{Runner: f, Stderr: &stderr})
+	require.Equal(t, 37, code)
+	require.Contains(t, stderr.String(), "warning")
 }
 
 func (f *fakeRunner) Resolve(_ context.Context, binary string, args []string) (policy.Plan, error) {
@@ -102,7 +111,22 @@ func TestCommandErrorUsesStderrAndStatusTwo(t *testing.T) {
 	code := Execute(context.Background(), "dproxy", []string{"not-a-command"}, &out, &errOut)
 	require.Equal(t, 2, code)
 	require.Empty(t, out.String())
-	require.Contains(t, errOut.String(), "project")
+	// An unrecognized tool name outside any project fails fast at provider
+	// resolution (the global path no longer treats "no project" as an error).
+	require.Contains(t, errOut.String(), "not-a-command")
+}
+
+func TestUnsupportedOSFailsClosed(t *testing.T) {
+	require.NoError(t, assertSupportedRuntime("linux"))
+	require.Error(t, assertSupportedRuntime("darwin"))
+	old := currentOS
+	currentOS = "darwin"
+	t.Cleanup(func() { currentOS = old })
+	var out, errOut bytes.Buffer
+	code := ExecuteWithDeps(context.Background(), "dproxy", []string{"version"}, Dependencies{Runner: &fakeRunner{}, Stdout: &out, Stderr: &errOut})
+	require.Equal(t, 2, code)
+	require.Empty(t, out.String())
+	require.Contains(t, errOut.String(), "linux")
 }
 
 func TestUsageAndPlanningFlagValidation(t *testing.T) {

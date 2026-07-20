@@ -159,6 +159,30 @@ func TestFindNotFound(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
+func TestFindOrGlobalCreatesSyntheticProject(t *testing.T) {
+	start := t.TempDir()
+	globalDir := filepath.Join(t.TempDir(), "global-project")
+	p, err := FindOrGlobal(start, globalDir)
+	require.NoError(t, err)
+	require.Equal(t, start, p.Root)
+	require.Equal(t, ".", p.RelativeWorkdir)
+	require.Len(t, p.ID, 32)
+	again, err := FindOrGlobal(start, globalDir)
+	require.NoError(t, err)
+	require.Equal(t, p.ID, again.ID)
+}
+
+func TestFindOrGlobalPrefersRealProject(t *testing.T) {
+	root := projectRoot(t)
+	nested := filepath.Join(root, "nested")
+	require.NoError(t, os.Mkdir(nested, 0755))
+	globalDir := filepath.Join(t.TempDir(), "global-project")
+	p, err := FindOrGlobal(nested, globalDir)
+	require.NoError(t, err)
+	require.Equal(t, root, p.Root)
+	require.Equal(t, "nested", p.RelativeWorkdir)
+}
+
 func TestIdentityOperationsStayOnOpenedDirectory(t *testing.T) {
 	root := projectRoot(t)
 	metadata := filepath.Join(root, ".dproxy")
