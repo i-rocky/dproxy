@@ -48,7 +48,7 @@ func fixtures(t *testing.T) (*client.Client, string, string) {
 		if fixtureErr != nil {
 			return
 		}
-		gatewayImage, fixtureErr = testimage.Scratch(ctx, fixtureAPI, "cmd/gateway", "dproxy-gateway")
+		gatewayImage, fixtureErr = testimage.Scratch(ctx, fixtureAPI, "cmd/gateway", "gateway")
 		if fixtureErr == nil {
 			fixtureErr = os.Setenv("DPROXY_INTEGRATION_IMAGE", attackerImage)
 		}

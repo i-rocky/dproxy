@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	networkpolicy "dproxy/internal/network"
@@ -111,7 +112,13 @@ func attestObjects(tables []*nftables.Table, chains []*nftables.Chain, sets []*n
 		if c.Table == nil || c.Table.Name != a.Table {
 			continue
 		}
-		ca := ChainAttestation{Name: c.Name, Type: string(c.Type), Hook: pointerInt(c.Hooknum), Priority: pointerInt(c.Priority), Policy: pointerInt(c.Policy)}
+		policy := pointerInt(c.Policy)
+		if policy != 0 {
+			// The kernel reports a default accept policy for base chains that were
+			// created without one; the only semantically meaningful value is drop(0).
+			policy = -1
+		}
+		ca := ChainAttestation{Name: c.Name, Type: string(c.Type), Hook: pointerInt(c.Hooknum), Priority: pointerInt(c.Priority), Policy: policy}
 		for _, r := range rules {
 			if r.Chain != nil && r.Chain.Name == c.Name {
 				b, err := canonicalExprs(r.Exprs)
@@ -147,17 +154,53 @@ func pointerInt(v any) int64 {
 func canonicalExprs(in []expr.Any) ([]byte, error) {
 	items := make([]any, 0, len(in))
 	for _, e := range in {
-		if lookup, ok := e.(*expr.Lookup); ok {
-			copy := *lookup
-			copy.SetID = 0
-			e = &copy
+		if redir, ok := e.(*expr.Redir); ok {
+			// The kernel sets NF_NAT_RANGE_PROTO_SPECIFIED (flags=2) for a
+			// single-port redirect on read-back; normalize before registers are
+			// zeroed (the decision depends on the original proto register).
+			c := *redir
+			if c.RegisterProtoMin > 0 {
+				c.Flags = 2
+			} else {
+				c.Flags = 0
+			}
+			e = &c
 		}
+		e = zeroRegisters(e)
 		items = append(items, struct {
 			Type  string
 			Value any
 		}{fmt.Sprintf("%T", e), e})
 	}
 	return json.Marshal(items)
+}
+
+// zeroRegisters returns a copy of e with register-number fields and set IDs
+// zeroed. The kernel reassigns registers (and fills derived fields) when a rule
+// is read back from netlink, so comparing absolute register numbers between a
+// created rule and its read-back form never matches. The attestation instead
+// compares the rule's durable semantics: expression types, payload offsets,
+// matched data (address families, protocols, prefixes, ports), and verdicts.
+func zeroRegisters(e expr.Any) expr.Any {
+	v := reflect.ValueOf(e)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return e
+	}
+	cp := reflect.New(v.Elem().Type())
+	cp.Elem().Set(v.Elem())
+	el := cp.Elem()
+	for i := 0; i < el.NumField(); i++ {
+		f := el.Field(i)
+		name := el.Type().Field(i).Name
+		if f.CanSet() && f.Kind() >= reflect.Uint && f.Kind() <= reflect.Uint64 && isRegisterField(name) {
+			f.SetUint(0)
+		}
+	}
+	return cp.Interface().(expr.Any)
+}
+
+func isRegisterField(name string) bool {
+	return strings.HasSuffix(name, "Register") || name == "RegisterProtoMin" || name == "RegisterProtoMax" || name == "SetID"
 }
 
 type recordNFT struct {

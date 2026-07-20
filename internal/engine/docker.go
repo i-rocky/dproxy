@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -289,7 +290,7 @@ func (d *Docker) StartGateway(ctx context.Context, s GatewaySpec) (Resource, err
 type gatewayHealthAPI interface {
 	ContainerInspect(context.Context, string) (types.ContainerJSON, error)
 	ContainerExecCreate(context.Context, string, container.ExecOptions) (types.IDResponse, error)
-	ContainerExecStart(context.Context, string, container.ExecStartOptions) error
+	ContainerExecAttach(context.Context, string, container.ExecAttachOptions) (types.HijackedResponse, error)
 	ContainerExecInspect(context.Context, string) (container.ExecInspect, error)
 }
 
@@ -308,19 +309,29 @@ func (d *Docker) GatewayHealth(ctx context.Context, r Resource, token string) er
 	if inspected.Config == nil || !labelsMatch(inspected.Config.Labels, r) {
 		return errors.New("gateway health target ownership mismatch")
 	}
-	exec, err := a.ContainerExecCreate(ctx, r.ID, container.ExecOptions{Cmd: []string{"/gateway", "health"}, Env: []string{"DPROXY_HEALTH_PROBE=" + token}})
+	exec, err := a.ContainerExecCreate(ctx, r.ID, container.ExecOptions{AttachStdout: true, AttachStderr: true, Cmd: []string{"/gateway", "health"}, Env: []string{"DPROXY_HEALTH_PROBE=" + token}})
 	if err != nil {
 		return fmt.Errorf("create gateway health probe: %w", err)
 	}
-	if err = a.ContainerExecStart(ctx, exec.ID, container.ExecStartOptions{}); err != nil {
-		return fmt.Errorf("run gateway health probe: %w", err)
+	// ContainerExecAttach POSTs to the hijacked /exec/{id}/start endpoint, which
+	// both starts the process and streams its IO. Calling ContainerExecStart too
+	// would hit /start a second time and the daemon rejects that ("exec command …
+	// is already running"), leaving the probe detached and unreadable. Draining
+	// the reader blocks until the process exits, so the inspect that follows
+	// observes the real exit status rather than a transiently-running exec.
+	attach, attachErr := a.ContainerExecAttach(ctx, exec.ID, container.ExecAttachOptions{Detach: false, Tty: false})
+	if attachErr != nil {
+		return fmt.Errorf("attach gateway health probe: %w", attachErr)
 	}
+	var probeStdout, probeStderr bytes.Buffer
+	_, _ = stdcopy.StdCopy(&probeStdout, &probeStderr, attach.Reader)
+	attach.Close()
 	status, err := a.ContainerExecInspect(ctx, exec.ID)
 	if err != nil {
 		return fmt.Errorf("inspect gateway health probe: %w", err)
 	}
 	if status.Running || status.ExitCode != 0 {
-		return errors.New("gateway health probe failed")
+		return fmt.Errorf("gateway health probe failed (exit=%d running=%v): %s", status.ExitCode, status.Running, strings.TrimSpace(probeStderr.String()))
 	}
 	return nil
 }

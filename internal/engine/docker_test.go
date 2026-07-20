@@ -120,8 +120,10 @@ func (f *fakeDockerAPI) ContainerExecCreate(_ context.Context, _ string, o conta
 	f.execOptions = o
 	return types.IDResponse{ID: "exec"}, nil
 }
-func (f *fakeDockerAPI) ContainerExecStart(context.Context, string, container.ExecStartOptions) error {
-	return nil
+func (f *fakeDockerAPI) ContainerExecAttach(context.Context, string, container.ExecAttachOptions) (types.HijackedResponse, error) {
+	a, b := net.Pipe()
+	_ = b.Close()
+	return types.HijackedResponse{Conn: a, Reader: bufio.NewReader(a)}, nil
 }
 func (f *fakeDockerAPI) ContainerExecInspect(context.Context, string) (container.ExecInspect, error) {
 	return container.ExecInspect{ExitCode: f.execExit}, nil
