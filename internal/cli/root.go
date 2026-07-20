@@ -97,6 +97,10 @@ parsed:
 		fmt.Fprintln(streams.Stderr, "usage: dproxy [--dry-run|--explain] <command|tool> [arguments...]")
 		return 2
 	}
+	if isHelpRequest(args[0]) {
+		fmt.Fprint(streams.Stdout, helpText)
+		return 0
+	}
 	if args[0] == "version" {
 		if len(args) != 1 || dryRun || explain {
 			return usage(streams, "version takes no arguments")
@@ -199,3 +203,39 @@ func isAdmin(name string) bool {
 		return false
 	}
 }
+
+// isHelpRequest recognizes an explicit top-level help request. Help is routed
+// to stdout and exits 0, matching the convention that asking for help is not
+// an error (unlike unrecognized input, which prints usage to stderr, exit 2).
+func isHelpRequest(arg string) bool {
+	switch arg {
+	case "help", "--help", "-h":
+		return true
+	default:
+		return false
+	}
+}
+
+const helpText = `Usage: dproxy [--dry-run|--explain] <command|tool> [arguments...]
+
+dproxy runs untrusted developer tools in disposable, locked-down containers.
+
+Commands:
+  init        create a .dproxy.toml for this project
+  install     install global shims and shell integration (no project required)
+  lock        pin tool image digests to the project lockfile
+  update      refresh pinned tool images
+  tool        add or remove tools
+  plugin      add, remove, sync, list, or inspect plugins
+  setup       install this project's tool shims from its lockfile
+  doctor      verify configuration, project, and Docker engine
+  cache       list, clean, or prune the shared cache
+  uninstall   remove global shims and shell integration
+  version     print the dproxy version
+
+Any other name runs that tool sandboxed, for example: dproxy npm install.
+--dry-run and --explain print the resolved plan instead of running it.
+
+Linux hosts only today; macOS and Windows backends are tracked same-release
+work (see docs/platform-backends.md).
+`

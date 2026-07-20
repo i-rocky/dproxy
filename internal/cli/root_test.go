@@ -106,6 +106,17 @@ func TestVersion(t *testing.T) {
 	require.Empty(t, errOut.String())
 }
 
+func TestHelpRequestPrintsUsageToStdout(t *testing.T) {
+	for _, arg := range []string{"help", "--help", "-h"} {
+		var out, errOut bytes.Buffer
+		code := Execute(context.Background(), "dproxy", []string{arg}, &out, &errOut)
+		require.Equal(t, 0, code, arg)
+		require.Empty(t, errOut.String(), arg)
+		require.Contains(t, out.String(), "Usage: dproxy")
+		require.Contains(t, out.String(), "Commands:")
+	}
+}
+
 func TestCommandErrorUsesStderrAndStatusTwo(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := Execute(context.Background(), "dproxy", []string{"not-a-command"}, &out, &errOut)
