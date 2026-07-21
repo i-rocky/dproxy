@@ -580,3 +580,16 @@ func TestSyncRefreshesTargetRecordAcrossRuns(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, "/tmp/stale-path", strings.TrimSpace(string(got)))
 }
+
+func TestSyncSweepsStaleTargetTemps(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	stale := filepath.Join(m.ShimDir, ".target-leftover")
+	require.NoError(t, os.WriteFile(stale, []byte("/old"), 0600))
+	require.NoError(t, m.Sync(map[string]Target{"node": {Binary: "node"}}))
+	_, err := os.Stat(stale)
+	require.True(t, os.IsNotExist(err), "recover must sweep stale .target- temps")
+	got, err := os.ReadFile(filepath.Join(m.ShimDir, TargetRecordName))
+	require.NoError(t, err)
+	require.Equal(t, m.Executable, strings.TrimSpace(string(got)))
+}

@@ -152,24 +152,23 @@ func (m Manager) writeTargetRecord(shimFD int) error {
 	}
 	f := os.NewFile(uintptr(fd), tmp)
 	_, writeErr := f.WriteString(m.Executable)
+	syncErr := f.Sync() // persist the path bytes before the rename exposes them
 	closeErr := f.Close()
-	if writeErr != nil {
-		_ = unix.Unlinkat(shimFD, tmp, 0)
-		return writeErr
-	}
-	if closeErr != nil {
-		_ = unix.Unlinkat(shimFD, tmp, 0)
-		return closeErr
+	for _, e := range []error{writeErr, syncErr, closeErr} {
+		if e != nil {
+			_ = unix.Unlinkat(shimFD, tmp, 0)
+			return e
+		}
 	}
 	if err := unix.Renameat2(shimFD, tmp, shimFD, TargetRecordName, unix.RENAME_NOREPLACE); err == nil {
-		return nil
+		return unix.Fsync(shimFD)
 	}
 	if err := unix.Renameat2(shimFD, tmp, shimFD, TargetRecordName, unix.RENAME_EXCHANGE); err != nil {
 		_ = unix.Unlinkat(shimFD, tmp, 0)
 		return err
 	}
 	_ = unix.Unlinkat(shimFD, tmp, 0)
-	return nil
+	return unix.Fsync(shimFD)
 }
 
 func (m Manager) Remove(name string) error {
@@ -547,6 +546,22 @@ func (m Manager) recover(ownersFD, binFD, shimFD, trashFD int) error {
 			continue
 		}
 		return ErrCollision
+	}
+	// Sweep stale writeTargetRecord temps: a crash between the rename and the
+	// unlink leaves a .target-<rand> file in ShimDir. These are never tracked in
+	// .owners, so collect them here to keep ShimDir bounded across interrupted
+	// installs. recover runs before writeTargetRecord within a Sync, so an
+	// in-flight temp from this process does not yet exist.
+	shimNames, err := dirNames(shimFD)
+	if err != nil {
+		return err
+	}
+	for _, name := range shimNames {
+		if strings.HasPrefix(name, ".target-") {
+			if err := unix.Unlinkat(shimFD, name, 0); err != nil && err != unix.ENOENT {
+				return err
+			}
+		}
 	}
 	return nil
 }
