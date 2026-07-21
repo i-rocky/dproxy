@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
 	networkpolicy "github.com/i-rocky/dproxy/internal/network"
 	"github.com/stretchr/testify/require"
 )
@@ -114,11 +115,35 @@ func TestNFTInstallDropsInboundExceptEstablishedAndLoopback(t *testing.T) {
 	require.NotNil(t, input, "an input chain must harden the gateway")
 	require.NotNil(t, input.Policy)
 	require.Equal(t, nftables.ChainPolicyDrop, *input.Policy, "inbound is default-deny")
-	var rules int
+	var hasEstablished, loopbackRules int
 	for _, r := range c.rules {
-		if r.Chain != nil && r.Chain.Name == "input" {
-			rules++
+		if r.Chain == nil || r.Chain.Name != "input" {
+			continue
+		}
+		var hasCt, hasLoopbackIP, hasPortMatch bool
+		for _, e := range r.Exprs {
+			p, ok := e.(*expr.Payload)
+			if !ok {
+				if _, ok := e.(*expr.Ct); ok {
+					hasCt = true
+				}
+				continue
+			}
+			if p.Base == expr.PayloadBaseNetworkHeader && (p.Offset == 16 || p.Offset == 24) {
+				hasLoopbackIP = true
+			}
+			if p.Base == expr.PayloadBaseTransportHeader && p.Offset == 2 {
+				hasPortMatch = true
+			}
+		}
+		if hasCt {
+			hasEstablished++
+		}
+		if hasLoopbackIP {
+			loopbackRules++
+			require.True(t, hasPortMatch, "input loopback accept must scope to the resolver port, not a bare dst-IP match")
 		}
 	}
-	require.Greater(t, rules, 0, "input must accept established/related and loopback before the drop")
+	require.Greater(t, hasEstablished, 0, "input must accept established/related return traffic")
+	require.GreaterOrEqual(t, loopbackRules, 4, "input must accept loopback DNS for IPv4+IPv6 × TCP+UDP")
 }

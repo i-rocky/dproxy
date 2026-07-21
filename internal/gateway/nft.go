@@ -73,16 +73,21 @@ func (n *NFT) Install() error {
 	}
 	// Input hardening: the gateway shares its network namespace with the command
 	// container, so legitimate inbound is only return traffic (established or
-	// related) and loopback (the redirected DNS query is delivered to the local
-	// resolver). The drop policy denies everything else, so peers on the egress
-	// network cannot reach the resolver or any other gateway listener.
+	// related) and the redirected DNS query delivered to the local resolver on
+	// 127.0.0.1:DNSPort. The loopback accept is scoped to that exact
+	// destination+port — mirroring the OUTPUT rule — so an external packet with a
+	// spoofed dst=127.0.0.1 (deliverable when a runtime disables martian
+	// filtering) cannot reach any other loopback listener. The drop policy denies
+	// everything else, so peers on the egress network cannot reach the resolver.
 	n.Conn.AddRule(&nftables.Rule{Table: t, Chain: input, Exprs: []expr.Any{&expr.Ct{Key: expr.CtKeySTATE, Register: 1}, &expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: stateMask, Xor: make([]byte, 4)}, &expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: make([]byte, 4)}, &expr.Verdict{Kind: expr.VerdictAccept}}})
 	for _, target := range []struct {
 		family    byte
 		offset, l uint32
 		addr      []byte
 	}{{unix.NFPROTO_IPV4, 16, 4, netip.MustParseAddr("127.0.0.1").AsSlice()}, {unix.NFPROTO_IPV6, 24, 16, netip.MustParseAddr("::1").AsSlice()}} {
-		n.Conn.AddRule(&nftables.Rule{Table: t, Chain: input, Exprs: []expr.Any{&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{target.family}}, &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: target.offset, Len: target.l}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: target.addr}, &expr.Verdict{Kind: expr.VerdictAccept}}})
+		for _, proto := range []byte{unix.IPPROTO_TCP, unix.IPPROTO_UDP} {
+			n.Conn.AddRule(&nftables.Rule{Table: t, Chain: input, Exprs: []expr.Any{&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{target.family}}, &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: target.offset, Len: target.l}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: target.addr}, &expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}}, &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(n.DNSPort)}, &expr.Verdict{Kind: expr.VerdictAccept}}})
+		}
 	}
 	// Redirect every unmarked TCP/UDP DNS attempt to the local validated resolver.
 	for _, proto := range []byte{unix.IPPROTO_TCP, unix.IPPROTO_UDP} {
