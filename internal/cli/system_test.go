@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -295,9 +296,12 @@ func TestExecuteSystemPlanComposesRuntimeAndMapsSandboxFailure(t *testing.T) {
 
 func TestDoctorUsesInjectedEngineVerification(t *testing.T) {
 	systemEnvironment(t)
-	oldVerify, oldLoad, oldEnsure := systemDoctorVerify, officialLoad, ensureGatewayImage
-	t.Cleanup(func() { systemDoctorVerify, officialLoad, ensureGatewayImage = oldVerify, oldLoad, oldEnsure })
+	oldVerify, oldLoad, oldEnsure, oldRefresh := systemDoctorVerify, officialLoad, ensureGatewayImage, refreshManagedShims
+	t.Cleanup(func() {
+		systemDoctorVerify, officialLoad, ensureGatewayImage, refreshManagedShims = oldVerify, oldLoad, oldEnsure, oldRefresh
+	})
 	officialLoad = func() (map[string]plugin.Manifest, error) { return map[string]plugin.Manifest{"node": {}}, nil }
+	refreshManagedShims = func() (int, error) { return 0, nil }
 	configPath := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "dproxy", "config.toml")
 
 	t.Run("engine unavailable fails fast", func(t *testing.T) {
@@ -408,4 +412,119 @@ func TestEnsureRootParentsCreatesMissingXDGParent(t *testing.T) {
 	cache := filepath.Join(root, "cache", "dproxy") // parent "cache" does not exist yet
 	require.NoError(t, ensureRootParents(cache))
 	require.DirExists(t, filepath.Dir(cache))
+}
+
+func TestShimBinaryIsStaleDetection(t *testing.T) {
+	dir := t.TempDir()
+	execPath := filepath.Join(dir, "dproxy")
+	shimPath := filepath.Join(dir, "dproxy-shim")
+	require.NoError(t, os.WriteFile(execPath, []byte("binary-v1"), 0700))
+
+	stale, err := shimBinaryIsStale(execPath, shimPath) // missing shim
+	require.NoError(t, err)
+	require.True(t, stale, "missing shim must be stale")
+
+	require.NoError(t, os.WriteFile(shimPath, []byte("binary-v0"), 0700))
+	stale, err = shimBinaryIsStale(execPath, shimPath) // different content
+	require.NoError(t, err)
+	require.True(t, stale, "mismatched shim must be stale")
+
+	require.NoError(t, os.WriteFile(shimPath, []byte("binary-v1"), 0700))
+	stale, err = shimBinaryIsStale(execPath, shimPath) // identical
+	require.NoError(t, err)
+	require.False(t, stale, "identical shim must be fresh")
+
+	_, err = shimBinaryIsStale(filepath.Join(dir, "missing"), shimPath) // missing executable
+	require.Error(t, err)
+}
+
+func TestDoctorShimStalenessAutofix(t *testing.T) {
+	systemEnvironment(t)
+	oldVerify, oldLoad, oldEnsure, oldRefresh := systemDoctorVerify, officialLoad, ensureGatewayImage, refreshManagedShims
+	t.Cleanup(func() {
+		systemDoctorVerify, officialLoad, ensureGatewayImage, refreshManagedShims = oldVerify, oldLoad, oldEnsure, oldRefresh
+	})
+	systemDoctorVerify = func(context.Context, config.UserConfig) error { return nil }
+	officialLoad = func() (map[string]plugin.Manifest, error) { return map[string]plugin.Manifest{"node": {}}, nil }
+	ensureGatewayImage = func(context.Context) (string, error) {
+		return "ghcr.io/i-rocky/dproxy-gateway@sha256:" + strings.Repeat("a", 64), nil
+	}
+	writeUserConfig(t)
+
+	_, _, dataRoot, err := userRoots()
+	require.NoError(t, err)
+	shimDir := filepath.Join(dataRoot, "shims")
+	require.NoError(t, os.MkdirAll(shimDir, 0700))
+	shimPath := filepath.Join(shimDir, genericShimName)
+	executable, err := os.Executable()
+	require.NoError(t, err)
+
+	t.Run("stale shim is refreshed", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(shimPath, []byte("stale"), 0700))
+		called := false
+		refreshManagedShims = func() (int, error) { called = true; return 1, nil }
+		var out bytes.Buffer
+		require.NoError(t, doctorCommand(context.Background(), Streams{Stdout: &out}))
+		require.True(t, called, "a stale shim must trigger a refresh")
+		require.Contains(t, out.String(), "shims: FIXED")
+	})
+
+	t.Run("missing shim is refreshed", func(t *testing.T) {
+		_ = os.Remove(shimPath)
+		called := false
+		refreshManagedShims = func() (int, error) { called = true; return 1, nil }
+		var out bytes.Buffer
+		require.NoError(t, doctorCommand(context.Background(), Streams{Stdout: &out}))
+		require.True(t, called, "a missing shim must trigger a refresh")
+		require.Contains(t, out.String(), "shims: FIXED")
+	})
+
+	t.Run("fresh shim is left alone", func(t *testing.T) {
+		src, err := os.Open(executable)
+		require.NoError(t, err)
+		defer src.Close()
+		dst, err := os.OpenFile(shimPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0700)
+		require.NoError(t, err)
+		_, err = io.Copy(dst, src)
+		_ = dst.Close()
+		require.NoError(t, err)
+		called := false
+		refreshManagedShims = func() (int, error) { called = true; return 0, nil }
+		var out bytes.Buffer
+		require.NoError(t, doctorCommand(context.Background(), Streams{Stdout: &out}))
+		require.False(t, called, "a fresh shim must not be refreshed")
+		require.Contains(t, out.String(), "shims: OK")
+	})
+
+	t.Run("refresh failure fails closed", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(shimPath, []byte("stale"), 0700))
+		refreshManagedShims = func() (int, error) { return 0, errors.New("disk full") }
+		var out bytes.Buffer
+		require.Error(t, doctorCommand(context.Background(), Streams{Stdout: &out}))
+		require.Contains(t, out.String(), "shims: FAIL")
+	})
+}
+
+func TestRefreshManagedShimsRealEndToEnd(t *testing.T) {
+	systemEnvironment(t)
+	// Exercise doctor's real production refresh path (copy the running binary +
+	// re-create symlinks via the hardened manager). Only officialLoad is injected
+	// (the test binary carries no provenance); refreshManagedShims itself is real.
+	oldLoad := officialLoad
+	t.Cleanup(func() { officialLoad = oldLoad })
+	officialLoad = func() (map[string]plugin.Manifest, error) { return map[string]plugin.Manifest{"node": {}}, nil }
+
+	n, err := refreshManagedShims()
+	require.NoError(t, err)
+	require.Greater(t, n, 0, "official tools must produce managed shims")
+
+	_, _, dataRoot, err := userRoots()
+	require.NoError(t, err)
+	shimPath := filepath.Join(dataRoot, "shims", genericShimName)
+	require.FileExists(t, shimPath)
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	stale, err := shimBinaryIsStale(executable, shimPath)
+	require.NoError(t, err)
+	require.False(t, stale, "a freshly refreshed shim must match the running binary")
 }

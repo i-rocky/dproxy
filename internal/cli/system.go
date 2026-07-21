@@ -2,9 +2,11 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -449,7 +451,34 @@ func doctorCommand(ctx context.Context, streams Streams) error {
 			}
 		}
 	}
-	fmt.Fprintln(w, "  shims: run 'dproxy install' to (re)create managed tool shims")
+	// Shims: the managed generic shim is a frozen copy of this binary made at
+	// install time, so it goes stale after an upgrade (e.g. `go install`) and
+	// every shimmed tool then fails with "plugin not found" until it is
+	// refreshed. Detect staleness and repair it here so a re-install is not
+	// required after every upgrade.
+	executable, execErr := os.Executable()
+	_, _, dataRoot, rootErr := userRoots()
+	if execErr != nil || rootErr != nil {
+		fmt.Fprintln(w, "  shims: run 'dproxy install' to (re)create managed tool shims")
+	} else {
+		shimPath := filepath.Join(dataRoot, "shims", genericShimName)
+		stale, staleErr := shimBinaryIsStale(executable, shimPath)
+		switch {
+		case staleErr != nil:
+			fmt.Fprintf(w, "  shims: FAIL (%v)\n", staleErr)
+			healthy = false
+		case !stale:
+			fmt.Fprintln(w, "  shims: OK")
+		default:
+			n, refreshErr := refreshManagedShims()
+			if refreshErr != nil {
+				fmt.Fprintf(w, "  shims: FAIL (refresh: %v)\n", refreshErr)
+				healthy = false
+			} else {
+				fmt.Fprintf(w, "  shims: FIXED (refreshed %d managed tool shims)\n", n)
+			}
+		}
+	}
 	if healthy {
 		fmt.Fprintln(w, "all checks passed")
 		return nil
@@ -486,6 +515,82 @@ var systemDoctorVerify = func(ctx context.Context, user config.UserConfig) error
 		return err
 	}
 	return engine.NewDocker(api).Verify(ctx)
+}
+
+// genericShimName is the frozen copy of the dproxy binary that every per-tool
+// symlink targets (see internal/shim.genericName). Kept in sync by hand.
+const genericShimName = "dproxy-shim"
+
+// shimBinaryIsStale reports whether the managed generic shim is missing or
+// differs from the running dproxy executable. The shim is a byte copy made at
+// install time, so after an upgrade (e.g. `go install @latest`) it lags behind
+// the real binary and every shimmed tool resolves to "plugin not found" until it
+// is refreshed. A missing shim is treated as stale.
+func shimBinaryIsStale(executable, shimPath string) (bool, error) {
+	want, err := sha256OfFile(executable)
+	if err != nil {
+		return false, err
+	}
+	got, err := sha256OfFile(shimPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return string(got) != string(want), nil
+}
+
+func sha256OfFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
+}
+
+// refreshManagedShims re-copies the running dproxy binary into the managed shim
+// directory and re-creates the per-tool symlinks, repairing staleness after an
+// upgrade. It is the same operation `dproxy install` performs, minus the shell
+// rc/completion wiring, so doctor stays a diagnostic. Injectable for tests.
+var refreshManagedShims = func() (int, error) {
+	_, _, dataRoot, err := userRoots()
+	if err != nil {
+		return 0, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return 0, err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0, err
+	}
+	if err := os.MkdirAll(filepath.Join(home, ".local"), 0700); err != nil {
+		return 0, err
+	}
+	// The hardened shim manager opens ShimDir beneath dataRoot with openat2
+	// RESOLVE_BENEATH semantics, which create only the final path component — so
+	// the parents must already exist (otherwise a first-run doctor on a fresh
+	// machine fails with ENOENT). Mirror installCommand's directory setup.
+	if err := os.MkdirAll(dataRoot, 0700); err != nil {
+		return 0, err
+	}
+	targets, err := officialTargets()
+	if err != nil {
+		return 0, err
+	}
+	manager := shim.Manager{BinDir: filepath.Join(home, ".local", "bin"), ShimDir: filepath.Join(dataRoot, "shims"), Executable: executable}
+	keep, _ := manageableTargets(manager, targets)
+	if err := manager.Sync(keep); err != nil {
+		return 0, err
+	}
+	return len(keep), nil
 }
 
 func cacheCommand(args []string, streams Streams) error {
