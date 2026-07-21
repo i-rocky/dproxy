@@ -528,3 +528,46 @@ func TestRefreshManagedShimsRealEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, stale, "a freshly refreshed shim must match the running binary")
 }
+
+func TestUpdateScopesToNamedToolAndPreservesOthers(t *testing.T) {
+	systemEnvironment(t)
+	writeUserConfig(t)
+	require.NoError(t, initProject(nil))
+	require.NoError(t, toolCommand([]string{"add", "node", "24"}))
+	require.NoError(t, toolCommand([]string{"add", "python", "3"}))
+	oldRepo, oldCommit := official.OfficialRepository, official.Commit
+	official.OfficialRepository, official.Commit = "https://github.com/example/dproxy.git", strings.Repeat("b", 40)
+	t.Cleanup(func() { official.OfficialRepository, official.Commit = oldRepo, oldCommit })
+	runner := systemRunner{}
+	streams := Streams{Stdout: new(bytes.Buffer), Stderr: new(bytes.Buffer)}
+
+	resolveAt := func(ver string) func(context.Context, config.Config, map[string]plugin.Manifest, string, string) (lock.File, error) {
+		return func(_ context.Context, cfg config.Config, manifests map[string]plugin.Manifest, platform, hash string) (lock.File, error) {
+			tools := make(map[string]lock.Tool, len(cfg.Tools))
+			plugins := make(map[string]lock.Plugin, len(cfg.Tools))
+			for name := range cfg.Tools {
+				m := manifests[name]
+				plugins[name] = lock.Plugin{Repository: m.Provenance.Repository, Commit: m.Provenance.Commit, ManifestSHA256: m.Provenance.ManifestSHA256, Schema: 1}
+				tools[name] = lock.Tool{Requested: cfg.Tools[name], Version: ver, Image: "registry.test/" + name, Tag: ver, Digest: "sha256:" + strings.Repeat("c", 64), Platform: platform}
+			}
+			return lock.File{Schema: 1, ConfigSHA256: hash, Plugins: plugins, Tools: tools}, nil
+		}
+	}
+	oldResolve := registryResolve
+	t.Cleanup(func() { registryResolve = oldResolve })
+
+	registryResolve = resolveAt("1.0.0")
+	require.NoError(t, runner.Command(context.Background(), "lock", nil, streams))
+
+	// Unknown tool name is rejected, not silently ignored.
+	require.ErrorContains(t, runner.Command(context.Background(), "update", []string{"rust"}, streams), "not configured")
+
+	// update node resolves only node; python's pinned version is preserved.
+	registryResolve = resolveAt("99.0.0")
+	require.NoError(t, runner.Command(context.Background(), "update", []string{"node"}, streams))
+
+	locked, err := lock.Load(".dproxy.lock")
+	require.NoError(t, err)
+	require.Equal(t, "99.0.0", locked.Tools["node"].Version, "named tool must be re-resolved")
+	require.Equal(t, "1.0.0", locked.Tools["python"].Version, "other tools must be untouched")
+}

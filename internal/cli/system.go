@@ -232,9 +232,8 @@ func resolveLock(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	manifests := map[string]plugin.Manifest{}
 	officialManifests, officialErr := official.Load()
-	for name := range cfg.Tools {
+	resolveManifest := func(name string) (plugin.Manifest, error) {
 		manifest, resolveErr := store.Resolve(name)
 		if resolveErr != nil && officialErr == nil {
 			var found bool
@@ -244,15 +243,60 @@ func resolveLock(ctx context.Context, args []string) error {
 			}
 		}
 		if resolveErr != nil {
-			return fmt.Errorf("resolve provider for %q: %w", name, resolveErr)
+			return plugin.Manifest{}, fmt.Errorf("resolve provider for %q: %w", name, resolveErr)
+		}
+		return manifest, nil
+	}
+	platform := runtime.GOOS + "/" + runtime.GOARCH
+	configHash := lock.HashConfig(raw)
+	lockPath := filepath.Join(p.Root, ".dproxy.lock")
+
+	// `dproxy update <tool>` resolves and merges ONLY the named tool into the
+	// existing lock, leaving every other tool's pinned entry untouched. Without
+	// this it silently re-locked every configured tool and ignored unknown names.
+	if len(args) == 1 && args[0] != "--all" {
+		name := args[0]
+		requested, ok := cfg.Tools[name]
+		if !ok {
+			return fmt.Errorf("update: %q is not configured; run 'dproxy tool add %s <version>' first", name, name)
+		}
+		manifest, err := resolveManifest(name)
+		if err != nil {
+			return err
+		}
+		filtered := config.Config{Schema: cfg.Schema, Tools: map[string]string{name: requested}}
+		resolved, err := registryResolve(ctx, filtered, map[string]plugin.Manifest{name: manifest}, platform, configHash)
+		if err != nil {
+			return err
+		}
+		existing, err := lock.Load(lockPath)
+		if err != nil {
+			return fmt.Errorf("update %q: %w (run 'dproxy lock' first)", name, err)
+		}
+		existing.Tools[name] = resolved.Tools[name]
+		if rp, ok := resolved.Plugins[name]; ok && rp.Repository != "" {
+			if existing.Plugins == nil {
+				existing.Plugins = map[string]lock.Plugin{}
+			}
+			existing.Plugins[name] = rp
+		}
+		existing.ConfigSHA256 = configHash
+		return lock.WriteAtomic(lockPath, existing)
+	}
+
+	manifests := map[string]plugin.Manifest{}
+	for name := range cfg.Tools {
+		manifest, err := resolveManifest(name)
+		if err != nil {
+			return err
 		}
 		manifests[name] = manifest
 	}
-	resolved, err := registryResolve(ctx, cfg, manifests, runtime.GOOS+"/"+runtime.GOARCH, lock.HashConfig(raw))
+	resolved, err := registryResolve(ctx, cfg, manifests, platform, configHash)
 	if err != nil {
 		return err
 	}
-	return lock.WriteAtomic(filepath.Join(p.Root, ".dproxy.lock"), resolved)
+	return lock.WriteAtomic(lockPath, resolved)
 }
 
 var registryResolve = func(ctx context.Context, cfg config.Config, manifests map[string]plugin.Manifest, platform, hash string) (lock.File, error) {
