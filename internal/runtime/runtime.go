@@ -17,6 +17,12 @@ import (
 
 const defaultCleanupTimeout = 10 * time.Second
 
+// forwardedCallTimeout bounds each forwarded resize/signal call to the daemon.
+// A Signal/Resize call only delivers to the container; it does not wait for a
+// shutdown, so this is generous, but it must be finite so a slow daemon cannot
+// pin the signal-forwarder goroutine. Tests shrink it.
+var forwardedCallTimeout = 5 * time.Second
+
 type PostStartError struct {
 	Status      int
 	StatusKnown bool
@@ -140,13 +146,20 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 	go func() {
 		defer close(done)
 		for sig := range signals {
+			// Each forwarded call gets its own bounded budget. The forwarded
+			// context is detached from the caller's cancellation (the command
+			// may have exited), so without an explicit deadline a wedged daemon
+			// call would hold this goroutine forever: the channel would never
+			// drain, done would never close, and cleanup would never run.
+			callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), forwardedCallTimeout)
 			if sig == syscall.SIGWINCH {
 				if streams.TTY {
-					_ = resize(context.WithoutCancel(ctx), deps.Engine, command.ID, streams.TerminalSize)
+					_ = resize(callCtx, deps.Engine, command.ID, streams.TerminalSize)
 				}
 			} else if supportedSignal(sig) {
-				_ = deps.Engine.Signal(context.WithoutCancel(ctx), command.ID, sig)
+				_ = deps.Engine.Signal(callCtx, command.ID, sig)
 			}
+			cancel()
 		}
 	}()
 	exitCode, err = deps.Engine.Wait(ctx, command.ID)
@@ -158,7 +171,14 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 		return exitCode, fmt.Errorf("relay command output: %w", err)
 	}
 	stop()
-	<-done
+	// A forwarded call that ignores its context (a truly wedged daemon) would
+	// otherwise pin the goroutine and block here indefinitely, deferring
+	// cleanup and leaking the container + per-invocation network. Bound the
+	// drain so resource cleanup always proceeds within the cleanup budget.
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
 	return exitCode, nil
 }
 

@@ -238,3 +238,69 @@ func TestRunResizesTTYInitiallyAndOnWINCHWithoutSendingSignal(t *testing.T) {
 	require.Contains(t, f.calls, "resize-40x120")
 	require.NotContains(t, f.calls, "signal")
 }
+
+// wedgeSignalEngine forwards Signal to a controlled block. ctxBlock makes the
+// call return when its context is cancelled (a daemon that respects
+// cancellation but is slow); when false the call ignores its context entirely
+// and blocks until release is closed (a truly wedged daemon).
+type wedgeSignalEngine struct {
+	recordingEngine
+	ctxBlock bool
+	release  chan struct{}
+}
+
+func (e *wedgeSignalEngine) Signal(ctx context.Context, _ string, _ os.Signal) error {
+	if e.ctxBlock {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	<-e.release
+	return nil
+}
+
+// A forwarded signal whose daemon call respects cancellation must be unblocked
+// by the per-call timeout, not pin the goroutine on the detached context.
+func TestRunUnblocksForwardedSignalOnCallTimeout(t *testing.T) {
+	old := forwardedCallTimeout
+	forwardedCallTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { forwardedCallTimeout = old })
+
+	signals := make(chan os.Signal, 1)
+	signals <- syscall.SIGINT
+	close(signals)
+	f := &fakeEngine{waitDelay: 10 * time.Millisecond}
+	e := &wedgeSignalEngine{recordingEngine: recordingEngine{f}, ctxBlock: true}
+	done := make(chan struct{})
+	go func() {
+		_, _ = Run(context.Background(), Dependencies{Engine: e, Network: fakeNetworkManager{&f.calls}, Signals: signals}, runtimePlan("none"), testIO())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run blocked on a context-respecting forwarded signal")
+	}
+	require.Contains(t, f.calls, "remove-command")
+}
+
+// A forwarded signal whose daemon call ignores cancellation (truly wedged) must
+// still not defer cleanup: the bounded drain lets resource removal proceed.
+func TestRunDoesNotLeakOnWedgedForwardedSignal(t *testing.T) {
+	signals := make(chan os.Signal, 1)
+	signals <- syscall.SIGINT
+	close(signals)
+	f := &fakeEngine{waitDelay: 10 * time.Millisecond}
+	e := &wedgeSignalEngine{recordingEngine: recordingEngine{f}, release: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		_, _ = Run(context.Background(), Dependencies{Engine: e, Network: fakeNetworkManager{&f.calls}, Signals: signals, CleanupTimeout: 40 * time.Millisecond}, runtimePlan("none"), testIO())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run blocked on a wedged forwarded signal, leaking cleanup")
+	}
+	close(e.release)
+	require.Contains(t, f.calls, "remove-command")
+}
