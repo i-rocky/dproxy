@@ -646,6 +646,13 @@ func validManifestPath(name string) bool {
 	return true
 }
 
+// maxManifestBytes caps how much of an externally sourced plugin manifest is
+// read into memory. Manifests come from trusted Git checkouts, so an unbounded
+// io.ReadAll would let a compromised repository OOM the process with a
+// multi-GiB blob before hashing or parsing it. Real manifests are a few KB;
+// 4 MiB matches the registry/lock untrusted-blob budget.
+const maxManifestBytes = 4 << 20
+
 func readRegularAt(base, name string) ([]byte, error) {
 	if !validManifestPath(name) {
 		return nil, errors.New("invalid manifest path")
@@ -674,5 +681,18 @@ func readRegularAt(base, name string) ([]byte, error) {
 	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG {
 		return nil, errors.New("not a regular file")
 	}
-	return io.ReadAll(file)
+	// Reject before allocating: stat.Size is authoritative for a regular file,
+	// so a huge manifest is refused with no ReadAll. LimitReader then bounds the
+	// allocation against a file that grew between stat and read.
+	if stat.Size > maxManifestBytes {
+		return nil, errors.New("manifest exceeds size limit")
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxManifestBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxManifestBytes {
+		return nil, errors.New("manifest exceeds size limit")
+	}
+	return raw, nil
 }

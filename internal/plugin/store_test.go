@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -116,6 +117,13 @@ func TestReadRegularAtRejectsSymlinkedComponents(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(target, "tool.toml"), []byte("secret"), 0o600))
 	require.NoError(t, os.Symlink(target, filepath.Join(base, "nested")))
 	_, err := readRegularAt(base, "nested/tool.toml")
+	require.Error(t, err)
+}
+
+func TestReadRegularAtRejectsOversizedManifest(t *testing.T) {
+	base := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(base, "tool.toml"), bytes.Repeat([]byte("x"), maxManifestBytes+1), 0o600))
+	_, err := readRegularAt(base, "tool.toml")
 	require.Error(t, err)
 }
 
