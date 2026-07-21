@@ -264,21 +264,45 @@ func resolveLock(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
+		existing, err := lock.Load(lockPath)
+		if err != nil {
+			return fmt.Errorf("update %q: %w (run 'dproxy lock' first)", name, err)
+		}
+		// A single-tool update must not mask other pending config changes. Advancing
+		// ConfigSHA256 below makes the lock Verify-pass against the current config;
+		// if any other tool's constraint changed (or a tool was added or removed),
+		// that tool would silently keep running its stale pinned version. Refuse
+		// and require a full `dproxy lock` instead.
+		if len(cfg.Tools) != len(existing.Tools) {
+			return fmt.Errorf("update %q: the configured tool set changed since the last lock; run 'dproxy lock'", name)
+		}
+		for other, otherRequested := range cfg.Tools {
+			if other == name {
+				continue
+			}
+			lockedTool, ok := existing.Tools[other]
+			if !ok || lockedTool.Requested != otherRequested {
+				return fmt.Errorf("update %q: %q also changed since the last lock; run 'dproxy lock'", name, other)
+			}
+		}
 		filtered := config.Config{Schema: cfg.Schema, Tools: map[string]string{name: requested}}
 		resolved, err := registryResolve(ctx, filtered, map[string]plugin.Manifest{name: manifest}, platform, configHash)
 		if err != nil {
 			return err
 		}
-		existing, err := lock.Load(lockPath)
-		if err != nil {
-			return fmt.Errorf("update %q: %w (run 'dproxy lock' first)", name, err)
+		if existing.Tools == nil {
+			existing.Tools = map[string]lock.Tool{}
 		}
 		existing.Tools[name] = resolved.Tools[name]
-		if rp, ok := resolved.Plugins[name]; ok && rp.Repository != "" {
+		// The resolver keys Plugins by manifest.Name (not the binary/cfg key), so a
+		// tool whose primary name differs — cargo/rustc/rustfmt → "rust", or
+		// npm/gofmt/pip under those names — must be merged under manifest.Name or
+		// its provenance is silently dropped.
+		if rp, ok := resolved.Plugins[manifest.Name]; ok && rp.Repository != "" {
 			if existing.Plugins == nil {
 				existing.Plugins = map[string]lock.Plugin{}
 			}
-			existing.Plugins[name] = rp
+			existing.Plugins[manifest.Name] = rp
 		}
 		existing.ConfigSHA256 = configHash
 		return lock.WriteAtomic(lockPath, existing)

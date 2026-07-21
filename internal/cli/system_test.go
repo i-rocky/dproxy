@@ -570,4 +570,41 @@ func TestUpdateScopesToNamedToolAndPreservesOthers(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "99.0.0", locked.Tools["node"].Version, "named tool must be re-resolved")
 	require.Equal(t, "1.0.0", locked.Tools["python"].Version, "other tools must be untouched")
+	require.Equal(t, 1, locked.Schema)
+	require.NotEmpty(t, locked.Plugins["node"].Repository, "named tool's plugin provenance must be refreshed (keyed by manifest.Name)")
+	require.Equal(t, "1.0.0", locked.Tools["python"].Version)
+	cfgBytes, err := os.ReadFile(".dproxy.toml")
+	require.NoError(t, err)
+	require.Equal(t, lock.HashConfig(cfgBytes), locked.ConfigSHA256, "ConfigSHA256 must advance to the current config hash")
+}
+
+func TestUpdateRefusesWhenAnotherToolChanged(t *testing.T) {
+	systemEnvironment(t)
+	writeUserConfig(t)
+	require.NoError(t, initProject(nil))
+	require.NoError(t, toolCommand([]string{"add", "node", "24"}))
+	require.NoError(t, toolCommand([]string{"add", "python", "3"}))
+	oldRepo, oldCommit := official.OfficialRepository, official.Commit
+	official.OfficialRepository, official.Commit = "https://github.com/example/dproxy.git", strings.Repeat("b", 40)
+	t.Cleanup(func() { official.OfficialRepository, official.Commit = oldRepo, oldCommit })
+	runner := systemRunner{}
+	streams := Streams{Stdout: new(bytes.Buffer), Stderr: new(bytes.Buffer)}
+	oldResolve := registryResolve
+	t.Cleanup(func() { registryResolve = oldResolve })
+	registryResolve = func(_ context.Context, cfg config.Config, manifests map[string]plugin.Manifest, platform, hash string) (lock.File, error) {
+		tools := make(map[string]lock.Tool, len(cfg.Tools))
+		plugins := make(map[string]lock.Plugin, len(cfg.Tools))
+		for name := range cfg.Tools {
+			m := manifests[name]
+			plugins[name] = lock.Plugin{Repository: m.Provenance.Repository, Commit: m.Provenance.Commit, ManifestSHA256: m.Provenance.ManifestSHA256, Schema: 1}
+			tools[name] = lock.Tool{Requested: cfg.Tools[name], Version: "1.0.0", Image: "registry.test/" + name, Tag: "1.0.0", Digest: "sha256:" + strings.Repeat("c", 64), Platform: platform}
+		}
+		return lock.File{Schema: 1, ConfigSHA256: hash, Plugins: plugins, Tools: tools}, nil
+	}
+	require.NoError(t, runner.Command(context.Background(), "lock", nil, streams))
+
+	// Edit python's constraint in the config, then update node: must refuse rather
+	// than advance ConfigSHA256 and leave python running its stale pin.
+	require.NoError(t, config.WriteAtomic(".dproxy.toml", config.Config{Schema: 1, Tools: map[string]string{"node": "24", "python": "4"}, Sandbox: config.Sandbox{}}))
+	require.ErrorContains(t, runner.Command(context.Background(), "update", []string{"node"}, streams), "also changed")
 }
