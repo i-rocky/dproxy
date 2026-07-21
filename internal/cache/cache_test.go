@@ -154,6 +154,28 @@ func TestCacheRejectsMarkerNotBoundToDirectory(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotOwned)
 }
 
+// A failure opening an intermediate cache directory must not leak the previous
+// iteration's descriptor. openOrPublishManagedDir fails on the leaf here only
+// after four intermediate directory descriptors were opened, so a missing close
+// on the error path surfaces as a net +1 in open file descriptors.
+func TestPathClosesDescriptorOnIntermediateFailure(t *testing.T) {
+	m := newCache(t)
+	path, err := m.Path("project", "node", "npm", "24", "linux-amd64")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(path, ownerFile), []byte(`{"schema":1,"device":0,"inode":0}`), 0600))
+	before := countOpenFDs(t)
+	_, err = m.Path("project", "node", "npm", "24", "linux-amd64")
+	require.ErrorIs(t, err, ErrNotOwned)
+	require.Equal(t, before, countOpenFDs(t), "intermediate directory descriptor leaked on open failure")
+}
+
+func countOpenFDs(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	require.NoError(t, err)
+	return len(entries)
+}
+
 func TestCacheFinalSubstitutionPreservesUnmanagedReplacement(t *testing.T) {
 	m := newCache(t)
 	path, err := m.Path("project", "node", "npm", "24", "linux-amd64")

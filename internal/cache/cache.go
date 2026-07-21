@@ -58,6 +58,13 @@ func (m Manager) Path(projectID, pluginName, tool, compatibility, platform strin
 	for _, key := range keys {
 		next, err := openOrPublishManagedDir(fd, key)
 		if err != nil {
+			// fd is the previous iteration's directory descriptor (rootFD on the
+			// first iteration, closed by the deferred close). A failure here must
+			// not leak it — unlike openAbsoluteManagedDir/walk, which close before
+			// the error check, this loop closed only on success.
+			if fd != rootFD {
+				unix.Close(fd)
+			}
 			return "", fmt.Errorf("open cache: %w", err)
 		}
 		if fd != rootFD {
