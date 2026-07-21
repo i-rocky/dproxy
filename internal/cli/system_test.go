@@ -608,3 +608,25 @@ func TestUpdateRefusesWhenAnotherToolChanged(t *testing.T) {
 	require.NoError(t, config.WriteAtomic(".dproxy.toml", config.Config{Schema: 1, Tools: map[string]string{"node": "24", "python": "4"}, Sandbox: config.Sandbox{}}))
 	require.ErrorContains(t, runner.Command(context.Background(), "update", []string{"node"}, streams), "also changed")
 }
+
+func TestGlobalAutoLockResolvesMultiBinaryToolOutsideProject(t *testing.T) {
+	systemEnvironment(t)
+	writeUserConfig(t)
+	oldRepo, oldCommit := official.OfficialRepository, official.Commit
+	official.OfficialRepository, official.Commit = "https://github.com/example/dproxy.git", strings.Repeat("b", 40)
+	t.Cleanup(func() { official.OfficialRepository, official.Commit = oldRepo, oldCommit })
+	oldResolve := registryResolve
+	registryResolve = func(_ context.Context, cfg config.Config, manifests map[string]plugin.Manifest, platform, hash string) (lock.File, error) {
+		manifest := manifests["rust"] // loadGlobalLock keys cfg + manifests by manifest.Name
+		return lock.File{Schema: 1, ConfigSHA256: hash, Plugins: map[string]lock.Plugin{manifest.Name: {Repository: manifest.Provenance.Repository, Commit: manifest.Provenance.Commit, ManifestSHA256: manifest.Provenance.ManifestSHA256, Schema: 1}}, Tools: map[string]lock.Tool{"rust": {Requested: cfg.Tools["rust"], Version: "1.90.0", Image: "registry.test/rust", Tag: "1.90.0", Digest: "sha256:" + strings.Repeat("c", 64), Platform: platform}}}, nil
+	}
+	t.Cleanup(func() { registryResolve = oldResolve })
+
+	// cargo's manifest is "rust" (Name not in Bins); without trying manifest.Name
+	// as a candidate this errors "tool cargo is not locked".
+	runner := systemRunner{}
+	plan, err := runner.Resolve(context.Background(), "cargo", []string{"--version"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"cargo", "--version"}, plan.Command)
+	require.FileExists(t, filepath.Join(os.Getenv("XDG_DATA_HOME"), "dproxy", "global-project", "rust.lock.json"))
+}

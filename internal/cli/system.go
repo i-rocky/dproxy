@@ -77,7 +77,11 @@ func resolveSystemPlan(ctx context.Context, binary string, args []string, readOn
 	}
 	tool, ok := state.locked.Tools[binary]
 	if !ok {
-		for _, provided := range state.manifest.Bins {
+		// The global auto-lock keys the synthetic lock by manifest.Name, which for
+		// multi-binary plugins (rust → cargo/rustc/rustfmt) is not in Bins. Try
+		// every provided binary AND the manifest's primary name so a tool run
+		// outside a project resolves against its manifest's single global lock.
+		for _, provided := range append(append([]string{}, state.manifest.Bins...), state.manifest.Name) {
 			if candidate, exists := state.locked.Tools[provided]; exists {
 				tool, ok = candidate, true
 				break
