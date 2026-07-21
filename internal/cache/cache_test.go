@@ -231,3 +231,13 @@ func TestCleanConcurrentSymlinkReplacementNeverTouchesOutside(t *testing.T) {
 	wg.Wait()
 	require.FileExists(t, canary)
 }
+
+func TestPruneSkipsStrayRegularFile(t *testing.T) {
+	m := newCache(t)
+	_, err := m.Path("project", "node", "npm", "24", "linux-amd64")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(m.Root, "stray-file"), []byte("x"), 0600))
+	// "stray-file" matches keyPattern but is a regular file, not a cache dir;
+	// Prune must skip it rather than abort on an O_DIRECTORY mismatch.
+	require.NoError(t, m.Prune(nil))
+}

@@ -111,6 +111,16 @@ func (m Manager) Prune(keep map[string]struct{}) error {
 		if !keyPattern.MatchString(name) {
 			return ErrUnsafeKey
 		}
+		// A cache key is a directory. A stray regular file whose name happens to
+		// match keyPattern is not a cache entry; skip it rather than letting
+		// quarantineAndDelete abort the whole prune on an O_DIRECTORY mismatch.
+		var st unix.Stat_t
+		if err := unix.Fstatat(rootFD, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return err
+		}
+		if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+			continue
+		}
 		if err := quarantineAndDelete(rootFD, rootFD, name); err != nil {
 			return err
 		}

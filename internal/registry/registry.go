@@ -41,7 +41,12 @@ func (r *Registry) Tags(ctx context.Context, repository string) ([]string, error
 	}
 	next := &url.URL{Scheme: "https", Host: host, Path: "/v2/" + path + "/tags/list"}
 	var result []string
-	for page := 0; next != nil && page < 100; page++ {
+	// Page until the registry stops returning a `next` link. The bound is a
+	// backstop against a malicious/buggy registry that loops on same-host links
+	// (validated by nextLink); 100k pages dwarfs any real repository (busybox,
+	// postgres, etc. sit in the low thousands) while staying finite.
+	const maxTagPages = 100000
+	for page := 0; next != nil && page < maxTagPages; page++ {
 		resp, err := r.get(ctx, next, "application/json")
 		if err != nil {
 			return nil, err
