@@ -83,6 +83,40 @@ func TestRuntimeControlsRequireForwardingAndFirewall(t *testing.T) {
 	r.NFT = &NFT{Conn: c, Policy: networkpolicy.Public(), DNSPort: 1053}
 	require.Error(t, r.InstallFirewall(context.Background()))
 }
+
+// If a later control fails, InstallControls must tear down the controls
+// already installed this bring-up — notably the DNS listener, which is bound
+// and serving before the firewall lands. A partially configured gateway is
+// never published ready, so leaving it live would leak a bound port and a
+// resolver reachable without its firewall.
+type closeRecordingControls struct {
+	*RuntimeControls
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *closeRecordingControls) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.RuntimeControls.Close()
+}
+
+func TestInstallControlsTearsDownPartialInstallOnFailure(t *testing.T) {
+	base := &RuntimeControls{
+		Policy:       networkpolicy.Public(),
+		Upstream:     "127.0.0.1:53",
+		ReadFile:     func(string) ([]byte, error) { return []byte("1\n"), nil },
+		ListenPacket: func(string, string) (net.PacketConn, error) { return newDummyPacket(), nil },
+		Listen:       func(string, string) (net.Listener, error) { return newDummyListener(), nil },
+		// NFT left nil so DNS+TCP+UDP install, then InstallFirewall fails.
+	}
+	r := &closeRecordingControls{RuntimeControls: base, closed: make(chan struct{})}
+	require.ErrorContains(t, InstallControls(context.Background(), r), "firewall")
+	select {
+	case <-r.closed:
+	case <-time.After(time.Second):
+		t.Fatal("Close was not invoked on the partially installed controls")
+	}
+}
 func TestForwardingReaderErrorsFailClosed(t *testing.T) {
 	require.Error(t, forwardingEnabledWith(func(string) ([]byte, error) { return nil, errors.New("read") }, "x"))
 	require.Error(t, forwardingEnabledWith(func(string) ([]byte, error) { return nil, nil }, "x"))

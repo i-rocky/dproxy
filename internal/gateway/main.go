@@ -43,6 +43,14 @@ func InstallControls(ctx context.Context, installer ControlInstaller) error {
 	}
 	for _, step := range steps {
 		if err := step.install(ctx); err != nil {
+			// Fail closed totally: a partially configured gateway must never be
+			// left live. Tear down whatever was installed — notably the DNS
+			// listener, which is bound and serving goroutines before the firewall
+			// lands — so no control outlives the failed bring-up. Readiness is
+			// never published on this path, so the gateway is unusable regardless.
+			if c, ok := installer.(interface{ Close() error }); ok {
+				_ = c.Close()
+			}
 			return fmt.Errorf("install %s: %w", step.name, err)
 		}
 	}
