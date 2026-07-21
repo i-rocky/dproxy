@@ -137,7 +137,7 @@ Dproxy ships official plugins embedded in the binary and also supports explicitl
 
 ## Shims and Commands
 
-`dproxy setup` (or `dproxy install`) installs managed symlinks in `~/.local/bin`. The symlinks target a single generic shim, a byte copy of the dproxy binary, under `~/.local/share/dproxy/shims`; the per-tool name is read from `argv[0]`. Symlink targets are constrained to that managed directory (symlink-resistance), which is why the generic shim is a copy rather than a link to the install path. Dproxy never overwrites an unmanaged path without explicit authorization. Ownership records and verified symlink targets ensure updates and uninstall remove only dproxy-managed entries.
+`dproxy install` and `dproxy setup` both install managed symlinks in `~/.local/bin`, but for different scopes. `install` is the global onboarding path: it requires no project, shims every binary in the bundled official manifests, and wires the shell rc files and completions. `setup` is the project-scoped path: it requires a `.dproxy.lock` and shims only the project's locked tools. The symlinks target a single generic shim, a byte copy of the dproxy binary, under `~/.local/share/dproxy/shims`; the per-tool name is read from `argv[0]`. Symlink targets are constrained to that managed directory (symlink-resistance), which is why the generic shim is a copy rather than a link to the install path. Dproxy never overwrites an unmanaged path without explicit authorization. Ownership records and verified symlink targets ensure updates and uninstall remove only dproxy-managed entries.
 
 Because the generic shim is a frozen copy, it would lag behind the real binary after an upgrade (for example `go install @latest` updates `~/go/bin/dproxy` but not the copy). To make a single upgrade update the whole install, `install` records the managing binary's absolute path next to the generic shim; on every invocation the generic shim reads that record and re-execs the recorded binary via `execve`, preserving `argv`, environment, controlling terminal, and exit status. The frozen copy's staleness is therefore transparent — the next invocation after an upgrade runs the fresh binary with no second command. If the record is absent or points somewhere invalid, the shim silently falls through to its own dispatch. `dproxy doctor` additionally refreshes the copy and record as a self-heal.
 
@@ -147,6 +147,7 @@ Primary commands include:
 
 ```text
 dproxy init
+dproxy install
 dproxy lock
 dproxy update <tool>|--all
 dproxy tool add|remove
@@ -154,6 +155,7 @@ dproxy plugin add|remove|sync|list|inspect
 dproxy setup
 dproxy doctor
 dproxy cache list|clean|prune
+dproxy version
 dproxy --explain <tool> ...
 dproxy --dry-run <tool> ...
 dproxy uninstall

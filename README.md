@@ -63,7 +63,10 @@ dproxy doctor
 `dproxy doctor` verifies the Docker engine, the user configuration, and the
 bundled plugins. When the user configuration is missing it **auto-provisions**:
 it resolves the published gateway image for your platform, pulls it, and writes a
-digest-pinned `~/.config/dproxy/config.toml`. Run it once after install.
+digest-pinned `~/.config/dproxy/config.toml`. It also **refreshes stale managed
+shims**: because each shim is a frozen copy of the dproxy binary, an upgrade
+(such as `go install @latest`) can leave the copy behind, so doctor re-copies the
+current binary into place. Run it once after install, and any time you upgrade.
 
 ## Plugins
 
