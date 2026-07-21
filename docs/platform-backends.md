@@ -20,10 +20,15 @@ A `GOOS=darwin go build ./...` fails today at, minimally:
 - `internal/cache` — `unix.Openat2`, `unix.OpenHow`,
   `unix.RESOLVE_BENEATH`, `unix.RESOLVE_NO_SYMLINKS` (descriptor-bounded path
   resolution), plus `Renameat2`.
-- `internal/project`, `internal/plugin` — `openat`-based ancestry walks,
-  `/proc/self/fd` descriptor paths, fd-stable identity creation.
 - `internal/gateway` — `github.com/google/nftables`, `/proc/sys/net/...`
   forwarding, `SO_MARK`; the entire nftables ruleset and attestation path.
+
+`internal/project` and `internal/plugin` are **not** compile blockers: their
+hardened ancestry walks use portable `unix.Open`/`Openat`/`Fstat` with
+`O_NOFOLLOW`/`O_DIRECTORY` and device+inode ownership records, all of which
+build on darwin. They still require OS-backend verification (see Backend 2)
+because the no-symlink/atomic-publication invariants rely on the surrounding
+`openat2`/`renameat2` primitives that the other packages lack off Linux.
 
 ## Backend 1 — Gateway dataplane
 

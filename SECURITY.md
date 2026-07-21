@@ -60,6 +60,21 @@ that is **deny-first** (the base chain policy is drop). The command container
 shares the gateway's network namespace, so all of its traffic passes through
 the filter.
 
+Two additional gateway controls close rebinding and resolver-exposure gaps:
+
+- **DNS TTL is clamped to the pin window.** Answers returned to the command
+  have their TTL clamped to the same ≤5-minute budget used for the nft endpoint
+  pin (the clamp and the pin share one TTL, capped at five minutes). A client
+  cache therefore cannot hold a resolved name longer than the gateway still
+  authorizes that (address, port) endpoint, so a stale cached answer cannot be
+  used past the authorization it was resolved under.
+- **The input chain locks down the resolver.** The gateway's input base chain
+  is drop and accepts only established/related traffic plus the redirected DNS
+  query delivered to `127.0.0.1:DNSPort` on loopback. Any other inbound traffic
+  — including probes from peers reachable on the egress network — is dropped,
+  so the resolver and the gateway are not reachable from the network the
+  command can talk to.
+
 ### Per-tool egress
 
 A tool's outbound allowlist is derived from its plugin manifest

@@ -245,7 +245,7 @@ The CLI and gateway are implemented in Go. The project favors the standard libra
 
 Expected components include a hand-rolled CLI dispatcher, `pelletier/go-toml/v2`, Masterminds semver constraints, the Docker Go SDK, `golang.org/x/sys`, `miekg/dns`, and `google/nftables`. The gateway is published as a minimal signed dproxy image pinned by digest; users do not build it during command execution.
 
-GitHub Actions provides CI. Releases include signed binaries, checksums, a software bill of materials, gateway image metadata, and reproducible-build information where practical.
+GitHub Actions provides CI. A tag cut by `release.yml` publishes SHA-256 checksums alongside the host binaries, plus keyless sigstore signatures and an SPDX SBOM; signatures and the SBOM run `continue-on-error`, so a release may ship without them if the signing or SBOM infrastructure is unavailable — their presence is best-effort, not guaranteed. The signed gateway image is published separately and continuously by `gateway.yml` and pinned by digest at runtime (doctor), not bundled in the tag release. Binaries are built with `-trimpath` and stripped ldflags for path reproducibility, though no reproducibility attestation is currently attached to a release.
 
 ## Testing Requirements
 
