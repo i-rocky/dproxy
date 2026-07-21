@@ -235,6 +235,44 @@ func TestGlobalAutoLockReadOnlyDoesNotPersist(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
+// A persisted global lock whose ConfigSHA256 no longer matches the global
+// config hash (stale, or tampered on disk) must not be trusted as the sandbox's
+// source of truth: loadGlobalLock re-resolves and overwrites it. This exercises
+// the Verify-failure branch, which TestGlobalAutoLockResolvesThenReuses (no
+// pre-existing lock) does not reach.
+func TestGlobalAutoLockReResolvesWhenPersistedLockIsStale(t *testing.T) {
+	systemEnvironment(t)
+	writeUserConfig(t)
+	oldRepo, oldCommit := official.OfficialRepository, official.Commit
+	official.OfficialRepository, official.Commit = "https://github.com/example/dproxy.git", strings.Repeat("b", 40)
+	t.Cleanup(func() { official.OfficialRepository, official.Commit = oldRepo, oldCommit })
+
+	globalDir := filepath.Join(os.Getenv("XDG_DATA_HOME"), "dproxy", "global-project")
+	require.NoError(t, os.MkdirAll(globalDir, 0o700))
+	// Loads fine (valid JSON, valid sha256 format) but Verify rejects it because
+	// the config hash diverges from GlobalConfigHash().
+	require.NoError(t, lock.WriteAtomic(filepath.Join(globalDir, "node.lock.json"), lock.File{Schema: 1, ConfigSHA256: strings.Repeat("a", 64)}))
+
+	var resolveCalls int
+	oldResolve := registryResolve
+	registryResolve = func(_ context.Context, cfg config.Config, manifests map[string]plugin.Manifest, platform, hash string) (lock.File, error) {
+		resolveCalls++
+		require.Equal(t, lock.GlobalConfigHash(), hash)
+		manifest := manifests["node"]
+		return lock.File{Schema: 1, ConfigSHA256: hash, Plugins: map[string]lock.Plugin{manifest.Name: {Repository: manifest.Provenance.Repository, Commit: manifest.Provenance.Commit, ManifestSHA256: manifest.Provenance.ManifestSHA256, Schema: 1}}, Tools: map[string]lock.Tool{"node": {Requested: cfg.Tools["node"], Version: "24.1.0", Image: "registry.test/node", Tag: "24.1.0", Digest: "sha256:" + strings.Repeat("c", 64), Platform: platform}}}, nil
+	}
+	t.Cleanup(func() { registryResolve = oldResolve })
+
+	runner := systemRunner{}
+	_, err := runner.Resolve(context.Background(), "npm", []string{"ci"})
+	require.NoError(t, err)
+	require.Equal(t, 1, resolveCalls, "a stale persisted lock must trigger re-resolution rather than be trusted")
+
+	got, err := lock.Load(filepath.Join(globalDir, "node.lock.json"))
+	require.NoError(t, err)
+	require.Equal(t, lock.GlobalConfigHash(), got.ConfigSHA256, "the stale lock must be overwritten with the verified one")
+}
+
 func TestResolveGlobalManifest(t *testing.T) {
 	_, _, dataRoot, err := userRoots()
 	require.NoError(t, err)
