@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -231,4 +232,25 @@ func TestMaybeReexecReadsRecordWhenInvokedAsShim(t *testing.T) {
 	// through (never reaching syscall.Exec, which would replace this process).
 	currentExecutable = func() (string, error) { return shimPath, nil }
 	require.NotPanics(t, func() { maybeReexecToRealBinary() })
+}
+
+func TestMaybeReexecExecvesRecordedTargetEndToEnd(t *testing.T) {
+	// Build a real dproxy binary to stand in for the generic shim; the test
+	// binary's main is the test harness, not cmd/dproxy, so it cannot trigger the
+	// preflight itself. This locks the load-bearing claim that a stale shim
+	// execve's the recorded managing binary.
+	dir := t.TempDir()
+	shimPath := filepath.Join(dir, genericShimName)
+	build := exec.Command("go", "build", "-o", shimPath, "github.com/i-rocky/dproxy/cmd/dproxy")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Skipf("go build unavailable in this environment: %v\n%s", err, out)
+	}
+
+	witness := filepath.Join(dir, "witness.sh")
+	require.NoError(t, os.WriteFile(witness, []byte("#!/bin/sh\necho REEXEC-OK\n"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, shim.TargetRecordName), []byte(witness), 0600))
+
+	out, err := exec.Command(shimPath, "ignored").Output()
+	require.NoError(t, err, "subprocess must execve the witness cleanly")
+	require.Contains(t, string(out), "REEXEC-OK", "the recorded target must be exec'd in place of the shim")
 }

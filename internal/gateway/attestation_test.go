@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
 	networkpolicy "github.com/i-rocky/dproxy/internal/network"
 	"github.com/stretchr/testify/require"
 )
@@ -68,4 +69,21 @@ func TestNFTAttestationFailsClosedOnQueryErrorsAndDuplicates(t *testing.T) {
 	q = installedSnapshot(t, p)
 	q.tables = append(q.tables, q.tables[0])
 	require.Error(t, VerifyNFTAttestation(p, 1053, q))
+}
+
+func TestNFTAttestationCanonicalizesRedirFlagsFromKernelReadback(t *testing.T) {
+	p, err := networkpolicy.Allowlist([]string{"a.example:443"})
+	require.NoError(t, err)
+	q := installedSnapshot(t, p)
+	// The created NAT redirect rule has Redir with Flags=0; the kernel sets
+	// Flags=2 on read-back when RegisterProtoMin>0. canonicalExprs must treat the
+	// two as equal — without it this snapshot would fail to attest.
+	for _, r := range q.rules {
+		for _, e := range r.Exprs {
+			if redir, ok := e.(*expr.Redir); ok && redir.RegisterProtoMin > 0 {
+				redir.Flags = 2
+			}
+		}
+	}
+	require.NoError(t, VerifyNFTAttestation(p, 1053, q), "kernel-read Flags=2 must attest equal to created Flags=0")
 }

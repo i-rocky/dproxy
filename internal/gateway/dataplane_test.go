@@ -113,3 +113,18 @@ func TestDNSPinsOnlyAssociatedPortsForSharedIP(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []PinnedEndpoint{{Addr: netip.MustParseAddr("93.184.216.34"), Port: 443}}, pin.pins)
 }
+
+func TestDNSClampsAnswerTTLToDefaultWhenMaxTTLUnset(t *testing.T) {
+	p, err := networkpolicy.Allowlist([]string{"example.com:443"})
+	require.NoError(t, err)
+	pin := &fakePinner{}
+	m := new(dns.Msg)
+	m.Answer = []dns.RR{&dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Ttl: 3600}, A: netip.MustParseAddr("93.184.216.34").AsSlice()}}
+	proxy := &DNSProxy{Policy: p, Upstream: "dns:53", Exchange: fakeExchange{m}, Pinner: pin} // MaxTTL unset
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	resp, err := proxy.resolve(context.Background(), q)
+	require.NoError(t, err)
+	require.Equal(t, 5*time.Minute, pin.ttl, "unset MaxTTL must fall back to the 5-minute pin lifetime")
+	require.Equal(t, uint32(300), resp.Answer[0].(*dns.A).Hdr.Ttl, "answer TTL must clamp to the default pin lifetime")
+}
