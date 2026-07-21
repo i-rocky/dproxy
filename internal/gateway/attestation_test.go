@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"bytes"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -86,4 +88,90 @@ func TestNFTAttestationCanonicalizesRedirFlagsFromKernelReadback(t *testing.T) {
 		}
 	}
 	require.NoError(t, VerifyNFTAttestation(p, 1053, q), "kernel-read Flags=2 must attest equal to created Flags=0")
+}
+
+// Rule order within a chain is semantically meaningful in nftables, so the
+// attestation must detect a reorder rather than treating rules as a set.
+func TestNFTAttestationDetectsRuleReorderWithinChain(t *testing.T) {
+	p, err := networkpolicy.Allowlist([]string{"a.example:443", "b.example:80"})
+	require.NoError(t, err)
+	q := installedSnapshot(t, p)
+	i, j, ok := distinctRulePair(q.rules)
+	require.True(t, ok, "fixture has no chain with two distinguishable rules")
+	q.rules[i], q.rules[j] = q.rules[j], q.rules[i]
+	require.Error(t, VerifyNFTAttestation(p, 1053, q), "reordered rules within a chain must be detected as a mismatch")
+}
+
+// The kernel reassigns registers and set IDs when a rule is read back over
+// netlink. zeroRegisters normalizes those fields so a created rule and its
+// read-back form attest equal; drift in any of them must not cause a mismatch.
+func TestNFTAttestationNormalizesKernelRegisterAndSetIDDrift(t *testing.T) {
+	p, err := networkpolicy.Allowlist([]string{"a.example:443", "b.example:80"})
+	require.NoError(t, err)
+	q := installedSnapshot(t, p)
+	n := mutateKernelAssignedFields(q.rules)
+	require.NotZero(t, n, "fixture exposes no register/SetID fields to normalize")
+	require.NoError(t, VerifyNFTAttestation(p, 1053, q), "kernel-reassigned registers/SetIDs must attest equal to the created ruleset")
+}
+
+func distinctRulePair(rules []*nftables.Rule) (int, int, bool) {
+	byChain := make(map[string][]int)
+	for i, r := range rules {
+		if r.Chain == nil {
+			continue
+		}
+		byChain[r.Chain.Name] = append(byChain[r.Chain.Name], i)
+	}
+	for _, idxs := range byChain {
+		if len(idxs) < 2 {
+			continue
+		}
+		canon := make([][]byte, len(idxs))
+		for k, idx := range idxs {
+			canon[k], _ = canonicalExprs(rules[idx].Exprs)
+		}
+		for a := 0; a < len(idxs); a++ {
+			for b := a + 1; b < len(idxs); b++ {
+				if !bytes.Equal(canon[a], canon[b]) {
+					return idxs[a], idxs[b], true
+				}
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// mutateKernelAssignedFields bumps every register-number / SetID field on the
+// snapshot's rule expressions, simulating the kernel reassigning them on
+// read-back. It returns the count of fields mutated so the test can confirm it
+// exercised real fields.
+func mutateKernelAssignedFields(rules []*nftables.Rule) int {
+	var n int
+	for r := range rules {
+		for k := range rules[r].Exprs {
+			mutateExprRegisterFields(&rules[r].Exprs[k], &n)
+		}
+	}
+	return n
+}
+
+func mutateExprRegisterFields(e *expr.Any, n *int) {
+	v := reflect.ValueOf(*e)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return
+	}
+	el := v.Elem()
+	for i := 0; i < el.NumField(); i++ {
+		f := el.Field(i)
+		name := el.Type().Field(i).Name
+		if !f.CanSet() || f.Kind() < reflect.Uint || f.Kind() > reflect.Uint64 || !isRegisterField(name) {
+			continue
+		}
+		if cur := f.Uint(); cur == 0 {
+			f.SetUint(7)
+		} else {
+			f.SetUint(cur + 7)
+		}
+		*n++
+	}
 }

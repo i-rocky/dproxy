@@ -141,6 +141,20 @@ func TestBuildDerivesEgressAllowlist(t *testing.T) {
 		require.Equal(t, []string{"registry.npmjs.org:443", "custom.example:443"}, got.Network.Allowlist)
 	})
 
+	t.Run("allowlist dedups user entries already in the manifest floor", func(t *testing.T) {
+		in := validInput(t, "npm", nil)
+		in.Sandbox.Network = "allowlist"
+		// A multi-port manifest floor (same host, two ports) plus a user entry
+		// that duplicates one floor port and one novel host:port.
+		in.Manifest.Egress = []plugin.EgressRule{{Host: "registry.npmjs.org", Ports: []int{443, 80}}}
+		in.Sandbox.NetworkAllowlist = []string{"registry.npmjs.org:443", "files.example:443"}
+		got, err := Build(in)
+		require.NoError(t, err)
+		// Floor preserved with both ports; the user's duplicate of the floor is
+		// collapsed; the novel entry is appended. The floor is never narrowed.
+		require.Equal(t, []string{"registry.npmjs.org:443", "registry.npmjs.org:80", "files.example:443"}, got.Network.Allowlist)
+	})
+
 	t.Run("allowlist satisfied by manifest egress alone", func(t *testing.T) {
 		in := validInput(t, "npm", nil)
 		in.Sandbox.Network = "allowlist"
