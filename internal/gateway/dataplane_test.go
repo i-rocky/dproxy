@@ -128,3 +128,39 @@ func TestDNSClampsAnswerTTLToDefaultWhenMaxTTLUnset(t *testing.T) {
 	require.Equal(t, 5*time.Minute, pin.ttl, "unset MaxTTL must fall back to the 5-minute pin lifetime")
 	require.Equal(t, uint32(300), resp.Answer[0].(*dns.A).Hdr.Ttl, "answer TTL must clamp to the default pin lifetime")
 }
+
+// The pin set is the DNS-rebinding defense: the firewall only permits
+// (address, port) endpoints that were pinned. Real registries return multiple
+// A/AAAA records and allowlist entries carry multiple ports, so resolve must
+// pin the full address×port cross-product. Every other pin test uses a single
+// record and a single port, so a broken or early-exiting nested loop would
+// pass silently and silently drop endpoints (fail-closed at the firewall) or
+// mis-scope them.
+func TestDNSPinsCrossProductOfMultipleAddressesAndPorts(t *testing.T) {
+	p, err := networkpolicy.Allowlist([]string{"example.com:443", "example.com:80"})
+	require.NoError(t, err)
+	pin := &fakePinner{}
+	m := new(dns.Msg)
+	m.Answer = []dns.RR{
+		&dns.A{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeA, Ttl: 60}, A: netip.MustParseAddr("93.184.216.34").AsSlice()},
+		&dns.AAAA{Hdr: dns.RR_Header{Name: "example.com.", Rrtype: dns.TypeAAAA, Ttl: 60}, AAAA: netip.MustParseAddr("2606:4700:4700::1111").AsSlice()},
+	}
+	proxy := &DNSProxy{Policy: p, Upstream: "dns:53", Exchange: fakeExchange{m}, Pinner: pin}
+	q := new(dns.Msg)
+	q.SetQuestion("example.com.", dns.TypeA)
+	_, err = proxy.resolve(context.Background(), q)
+	require.NoError(t, err)
+	require.Len(t, pin.pins, 4, "2 addresses x 2 ports must pin the full cross-product")
+	got := make(map[PinnedEndpoint]bool, len(pin.pins))
+	for _, ep := range pin.pins {
+		got[ep] = true
+	}
+	for _, want := range []PinnedEndpoint{
+		{Addr: netip.MustParseAddr("93.184.216.34"), Port: 443},
+		{Addr: netip.MustParseAddr("93.184.216.34"), Port: 80},
+		{Addr: netip.MustParseAddr("2606:4700:4700::1111"), Port: 443},
+		{Addr: netip.MustParseAddr("2606:4700:4700::1111"), Port: 80},
+	} {
+		require.True(t, got[want], "missing pin %s:%d", want.Addr, want.Port)
+	}
+}
