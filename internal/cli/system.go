@@ -503,7 +503,12 @@ func doctorCommand(ctx context.Context, streams Streams) error {
 	executable, execErr := os.Executable()
 	_, _, dataRoot, rootErr := userRoots()
 	if execErr != nil || rootErr != nil {
-		fmt.Fprintln(w, "  shims: run 'dproxy install' to (re)create managed tool shims")
+		locateErr := execErr
+		if locateErr == nil {
+			locateErr = rootErr
+		}
+		fmt.Fprintf(w, "  shims: FAIL (locate: %v)\n", locateErr)
+		healthy = false
 	} else {
 		shimPath := filepath.Join(dataRoot, "shims", genericShimName)
 		stale, staleErr := shimBinaryIsStale(executable, shimPath)
@@ -518,8 +523,10 @@ func doctorCommand(ctx context.Context, streams Streams) error {
 			if refreshErr != nil {
 				fmt.Fprintf(w, "  shims: FAIL (refresh: %v)\n", refreshErr)
 				healthy = false
+			} else if n > 0 {
+				fmt.Fprintf(w, "  shims: FIXED (refreshed generic shim + %d tool links)\n", n)
 			} else {
-				fmt.Fprintf(w, "  shims: FIXED (refreshed %d managed tool shims)\n", n)
+				fmt.Fprintln(w, "  shims: FIXED (refreshed generic shim)")
 			}
 		}
 	}
