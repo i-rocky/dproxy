@@ -32,13 +32,17 @@ type NFT struct {
 	table              *nftables.Table
 	allowed4, allowed6 *nftables.Set
 	// mu serializes Conn mutations. The DNS server dispatches each query on its
-	// own goroutine, and *nftables.Conn is not concurrency-safe: its message
-	// buffer is appended by SetAddElements and drained by Flush, so two
-	// interleaved Pin calls corrupt the netlink batch and silently drop the pin.
+	// own goroutine and is live before InstallFirewall finishes, so Install and
+	// Pin can overlap during gateway bring-up. *nftables.Conn is not
+	// concurrency-safe — its message buffer is appended by SetAddElements and
+	// drained by Flush — and Install writes the Conn/table/set fields that Pin
+	// reads, so both operations take this mutex.
 	mu sync.Mutex
 }
 
 func (n *NFT) Install() error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	if n.Conn == nil {
 		n.Conn = &nftables.Conn{}
 	}
@@ -155,14 +159,17 @@ func addLookupRule(c nftConn, t *nftables.Table, ch *nftables.Chain, set *nftabl
 	}
 }
 func (n *NFT) Pin(_ context.Context, pins []PinnedEndpoint, ttl time.Duration) error {
-	if n.Conn == nil || n.allowed4 == nil {
-		return errors.New("nft pin sets unavailable")
-	}
 	if ttl <= 0 || ttl > 5*time.Minute {
 		return errors.New("invalid pin expiry")
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	// Conn/allowed4 are read under the lock: Install mutates them, and the DNS
+	// serve loop is live before InstallFirewall completes, so an unlocked read
+	// here races gateway bring-up.
+	if n.Conn == nil || n.allowed4 == nil {
+		return errors.New("nft pin sets unavailable")
+	}
 	var v4, v6 []nftables.SetElement
 	for _, pin := range pins {
 		if pin.Port == 0 || !pin.Addr.IsValid() || !n.Policy.AllowsIP(pin.Addr) {

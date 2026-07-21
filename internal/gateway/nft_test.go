@@ -191,3 +191,39 @@ func TestNFTPinSerializesConcurrentSetAddElements(t *testing.T) {
 	wg.Wait()
 	require.EqualValues(t, 1, atomic.LoadInt32(&c.maxSeen), "Pin must serialize Conn mutation across concurrent DNS queries")
 }
+
+// installSlowConn slows Install's AddRule path so a concurrent Pin overlaps
+// Install's writes to the shared Conn/table/set fields. Run under -race: the
+// unlocked read of n.Conn/n.allowed4 in Pin (and Install's unlocked writes)
+// would be flagged before Install took the NFT mutex.
+type installSlowConn struct {
+	*fakeNFTConn
+	delay time.Duration
+}
+
+func (c *installSlowConn) AddRule(r *nftables.Rule) *nftables.Rule {
+	time.Sleep(c.delay)
+	return c.fakeNFTConn.AddRule(r)
+}
+
+// The DNS serve loop is live before InstallFirewall runs, so Install and Pin can
+// overlap during bring-up. Install must take the NFT mutex so its writes to the
+// shared Conn/table/set fields and its Flush cannot interleave with Pin's reads
+// and SetAddElements.
+func TestNFTInstallSerializesAgainstConcurrentPin(t *testing.T) {
+	p, err := networkpolicy.Allowlist([]string{"example.com:443"})
+	require.NoError(t, err)
+	c := &installSlowConn{fakeNFTConn: &fakeNFTConn{}, delay: 2 * time.Millisecond}
+	n := &NFT{Conn: c, Policy: p, DNSPort: 1053}
+	addr := netip.MustParseAddr("93.184.216.34")
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = n.Install() }()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			_ = n.Pin(context.Background(), []PinnedEndpoint{{Addr: addr, Port: 443}}, time.Minute)
+		}
+	}()
+	wg.Wait()
+}
