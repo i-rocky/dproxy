@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
@@ -24,13 +26,14 @@ func main() {
 		if err := fs.Parse(os.Args[2:]); err != nil {
 			fatal(err)
 		}
-		p, err := gateway.LoadPolicy(*policy)
+		p, raw, err := gateway.LoadPolicyWithBytes(*policy)
 		if err != nil {
 			fatal(err)
 		}
+		ph := sha256.Sum256(raw)
 		n := &gateway.NFT{Policy: p, DNSPort: 1053}
 		controls := &gateway.RuntimeControls{Policy: p, Upstream: os.Getenv("DPROXY_DNS_UPSTREAM"), NFT: n}
-		fatal(gateway.ServeWithToken(context.Background(), *policy, readyPath, os.Getenv("DPROXY_HEALTH_TOKEN"), controls))
+		fatal(gateway.ServeWithToken(context.Background(), hex.EncodeToString(ph[:]), readyPath, os.Getenv("DPROXY_HEALTH_TOKEN"), controls))
 	default:
 		fatal(fmt.Errorf("unknown gateway command"))
 	}

@@ -27,14 +27,23 @@ func writePublicPolicy(t *testing.T, path string) {
 	require.NoError(t, os.WriteFile(path, b, 0400))
 }
 
+func loadHashedPolicy(t *testing.T, path string) string {
+	t.Helper()
+	_, raw, err := LoadPolicyWithBytes(path)
+	require.NoError(t, err)
+	ph := sha256.Sum256(raw)
+	return hex.EncodeToString(ph[:])
+}
+
 func TestServePublishesAuthenticatedReadinessOnlyAfterControls(t *testing.T) {
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.json")
 	ready := filepath.Join(dir, "ready")
 	writePublicPolicy(t, policyPath)
+	policyHash := loadHashedPolicy(t, policyPath)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- ServeWithToken(ctx, policyPath, ready, "token", &fakeControls{}) }()
+	go func() { done <- ServeWithToken(ctx, policyHash, ready, "token", &fakeControls{}) }()
 	require.Eventually(t, func() bool { return Health(ready, "token", "token") == nil }, time.Second, time.Millisecond)
 	require.Error(t, Health(ready, "token", "wrong"))
 	cancel()
@@ -46,7 +55,8 @@ func TestServeDoesNotPublishReadinessOnSetupFailure(t *testing.T) {
 	policyPath := filepath.Join(dir, "policy.json")
 	ready := filepath.Join(dir, "ready")
 	writePublicPolicy(t, policyPath)
-	require.Error(t, ServeWithToken(context.Background(), policyPath, ready, "token", &fakeControls{fail: "udp"}))
+	policyHash := loadHashedPolicy(t, policyPath)
+	require.Error(t, ServeWithToken(context.Background(), policyHash, ready, "token", &fakeControls{fail: "udp"}))
 	_, err := os.Stat(ready)
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
@@ -55,7 +65,8 @@ func TestServeAndHealthRejectEmptyOrMismatchedTokens(t *testing.T) {
 	policy := filepath.Join(dir, "policy")
 	ready := filepath.Join(dir, "ready")
 	writePublicPolicy(t, policy)
-	require.ErrorContains(t, ServeWithToken(context.Background(), policy, ready, "", &fakeControls{}), "nonempty")
+	policyHash := loadHashedPolicy(t, policy)
+	require.ErrorContains(t, ServeWithToken(context.Background(), policyHash, ready, "", &fakeControls{}), "nonempty")
 	empty := sha256.Sum256(nil)
 	record, _ := json.Marshal(readiness{Controls: readyState, TokenHash: hex.EncodeToString(empty[:])})
 	require.NoError(t, os.WriteFile(ready, record, 0400))
@@ -68,6 +79,39 @@ func TestHealthRejectsWritableReadinessState(t *testing.T) {
 	record, _ := json.Marshal(readiness{Controls: readyState, TokenHash: hex.EncodeToString(h[:])})
 	require.NoError(t, os.WriteFile(path, record, 0600))
 	require.ErrorContains(t, Health(path, "token", "token"), "mode")
+}
+
+// The readiness record must attest the hash of the bytes that were parsed into
+// the enforced policy. Rewriting the policy file after enforcement is captured
+// but before readiness is published must not change the attested hash — that is
+// the startup TOCTOU between enforcement and attestation.
+func TestServeAttestsHashOfEnforcedPolicyBytes(t *testing.T) {
+	dir := t.TempDir()
+	policyPath := filepath.Join(dir, "policy.json")
+	ready := filepath.Join(dir, "ready")
+	writePublicPolicy(t, policyPath)
+	policyHash := loadHashedPolicy(t, policyPath)
+	changed := networkpolicy.Public()
+	changed.DeniedPrefixes = append(changed.DeniedPrefixes, "203.0.113.0/25")
+	changedBytes, err := json.Marshal(changed)
+	require.NoError(t, err)
+	require.NoError(t, os.Chmod(policyPath, 0600))
+	require.NoError(t, os.WriteFile(policyPath, changedBytes, 0600))
+	require.NoError(t, os.Chmod(policyPath, 0400))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ServeWithToken(ctx, policyHash, ready, "token", &fakeControls{}) }()
+	require.Eventually(t, func() bool { _, e := os.Stat(ready); return e == nil }, time.Second, time.Millisecond)
+	stateBytes, err := os.ReadFile(ready)
+	require.NoError(t, err)
+	var state readiness
+	require.NoError(t, json.Unmarshal(stateBytes, &state))
+	cancel()
+	<-done
+	require.Equal(t, policyHash, state.PolicyHash)
+	rewritten := sha256.Sum256(changedBytes)
+	require.NotEqual(t, hex.EncodeToString(rewritten[:]), state.PolicyHash)
 }
 
 type fakeInspector struct {
@@ -119,9 +163,10 @@ func TestSystemHealthChecksPolicyHashBeforeKernel(t *testing.T) {
 	policy := filepath.Join(dir, "policy")
 	ready := filepath.Join(dir, "ready")
 	writePublicPolicy(t, policy)
+	policyHash := loadHashedPolicy(t, policy)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- ServeWithToken(ctx, policy, ready, "token", &fakeControls{}) }()
+	go func() { done <- ServeWithToken(ctx, policyHash, ready, "token", &fakeControls{}) }()
 	require.Eventually(t, func() bool { _, e := os.Stat(ready); return e == nil }, time.Second, time.Millisecond)
 	require.NoError(t, os.Chmod(policy, 0600))
 	changed := networkpolicy.Public()

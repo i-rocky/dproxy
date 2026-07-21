@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -49,28 +50,50 @@ func InstallControls(ctx context.Context, installer ControlInstaller) error {
 }
 
 func LoadPolicy(path string) (networkpolicy.Policy, error) {
+	p, _, err := LoadPolicyWithBytes(path)
+	return p, err
+}
+
+// LoadPolicyWithBytes reads, parses, and validates the policy in a single read
+// and returns the exact on-disk bytes alongside the parsed policy. Callers that
+// attest to the enforced policy must hash these bytes rather than re-reading
+// the file: a second read would open a startup TOCTOU in which the attested
+// hash could diverge from the ruleset actually parsed.
+func LoadPolicyWithBytes(path string) (networkpolicy.Policy, []byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return networkpolicy.Policy{}, fmt.Errorf("inspect policy: %w", err)
+		return networkpolicy.Policy{}, nil, fmt.Errorf("inspect policy: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return networkpolicy.Policy{}, errors.New("policy must be a regular file")
+		return networkpolicy.Policy{}, nil, errors.New("policy must be a regular file")
 	}
 	if info.Mode().Perm()&0222 != 0 {
-		return networkpolicy.Policy{}, errors.New("policy must be read-only")
+		return networkpolicy.Policy{}, nil, errors.New("policy must be read-only")
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return networkpolicy.Policy{}, fmt.Errorf("open policy: %w", err)
+		return networkpolicy.Policy{}, nil, fmt.Errorf("open policy: %w", err)
 	}
 	defer f.Close()
-	dec := json.NewDecoder(io.LimitReader(f, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(f, 1<<20))
+	if err != nil {
+		return networkpolicy.Policy{}, nil, fmt.Errorf("read policy: %w", err)
+	}
+	p, err := parsePolicy(raw)
+	if err != nil {
+		return networkpolicy.Policy{}, nil, err
+	}
+	return p, raw, nil
+}
+
+func parsePolicy(raw []byte) (networkpolicy.Policy, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	var p networkpolicy.Policy
-	if err = dec.Decode(&p); err != nil {
+	if err := dec.Decode(&p); err != nil {
 		return networkpolicy.Policy{}, fmt.Errorf("decode policy: %w", err)
 	}
-	if err = ensureEOF(dec); err != nil {
+	if err := ensureEOF(dec); err != nil {
 		return networkpolicy.Policy{}, err
 	}
 	if p.Mode != "public" && p.Mode != "allowlist" {
@@ -93,11 +116,11 @@ func LoadPolicy(path string) (networkpolicy.Policy, error) {
 		return networkpolicy.Policy{}, errors.New("policy has no protected ranges")
 	}
 	for _, raw := range p.DeniedPrefixes {
-		if _, err = netip.ParsePrefix(raw); err != nil {
+		if _, err := netip.ParsePrefix(raw); err != nil {
 			return networkpolicy.Policy{}, errors.New("invalid protected prefix")
 		}
 	}
-	if err = p.ValidateBaseline(); err != nil {
+	if err := p.ValidateBaseline(); err != nil {
 		return networkpolicy.Policy{}, fmt.Errorf("validate mandatory deny baseline: %w", err)
 	}
 	return p, nil
@@ -120,15 +143,18 @@ type readiness struct{ Controls, PolicyHash, TokenHash string }
 
 // Serve installs all controls before publishing readiness. The readiness file
 // lives on the gateway's private /run tmpfs and is never created on failure.
-func Serve(ctx context.Context, policyPath, readyPath string, installer ControlInstaller) error {
-	return ServeWithToken(ctx, policyPath, readyPath, "", installer)
+func Serve(ctx context.Context, policyHash, readyPath string, installer ControlInstaller) error {
+	return ServeWithToken(ctx, policyHash, readyPath, "", installer)
 }
-func ServeWithToken(ctx context.Context, policyPath, readyPath, token string, installer ControlInstaller) error {
+
+// ServeWithToken installs controls and publishes readiness attesting to
+// policyHash, which the caller must derive from the exact bytes it parsed into
+// the enforced policy (see LoadPolicyWithBytes). Loading or re-reading the
+// policy here would open a startup TOCTOU between the enforced ruleset and the
+// attested hash.
+func ServeWithToken(ctx context.Context, policyHash, readyPath, token string, installer ControlInstaller) error {
 	if token == "" {
 		return errors.New("nonempty gateway health token is required")
-	}
-	if _, err := LoadPolicy(policyPath); err != nil {
-		return err
 	}
 	if err := InstallControls(ctx, installer); err != nil {
 		return err
@@ -136,13 +162,8 @@ func ServeWithToken(ctx context.Context, policyPath, readyPath, token string, in
 	if ready, ok := installer.(interface{ Ready() bool }); ok && !ready.Ready() {
 		return errors.New("gateway controls did not report readiness")
 	}
-	policyBytes, err := os.ReadFile(policyPath)
-	if err != nil {
-		return err
-	}
-	ph := sha256.Sum256(policyBytes)
 	th := sha256.Sum256([]byte(token))
-	record, _ := json.Marshal(readiness{Controls: readyState, PolicyHash: hex.EncodeToString(ph[:]), TokenHash: hex.EncodeToString(th[:])})
+	record, _ := json.Marshal(readiness{Controls: readyState, PolicyHash: policyHash, TokenHash: hex.EncodeToString(th[:])})
 	if err := os.WriteFile(readyPath, record, 0400); err != nil {
 		return fmt.Errorf("publish gateway readiness: %w", err)
 	}
