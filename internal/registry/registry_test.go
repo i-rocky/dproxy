@@ -60,6 +60,22 @@ func TestRegistryTagsPaginationAndBearerAuthentication(t *testing.T) {
 	require.Equal(t, []string{"v1", "v2"}, tags)
 }
 
+// A malicious registry in the threat model can serve a same-host next link
+// forever. The page cap alone admits hundreds of GB (each page can be
+// maxResponse bytes), so the accumulated tag slice must be bounded too.
+func TestRegistryTagsBoundsAccumulationAcrossPages(t *testing.T) {
+	batch := make([]string, 20000)
+	for i := range batch {
+		batch[i] = fmt.Sprintf("t%d", i)
+	}
+	body := `{"tags":["` + strings.Join(batch, `","`) + `"]}`
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) *http.Response {
+		return response(200, http.Header{"Link": {`</v2/team/tool/tags/list?last=more>; rel="next"`}}, body)
+	})}
+	_, err := New(client).Tags(context.Background(), "registry.test/team/tool")
+	require.ErrorContains(t, err, "tag count exceeded")
+}
+
 func TestRegistryResolvesPlatformManifestDigest(t *testing.T) {
 	manifest := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`)
 	sum := sha256.Sum256(manifest)

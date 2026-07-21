@@ -41,11 +41,16 @@ func (r *Registry) Tags(ctx context.Context, repository string) ([]string, error
 	}
 	next := &url.URL{Scheme: "https", Host: host, Path: "/v2/" + path + "/tags/list"}
 	var result []string
-	// Page until the registry stops returning a `next` link. The bound is a
+	// Page until the registry stops returning a `next` link. maxTagPages is a
 	// backstop against a malicious/buggy registry that loops on same-host links
 	// (validated by nextLink); 100k pages dwarfs any real repository (busybox,
-	// postgres, etc. sit in the low thousands) while staying finite.
-	const maxTagPages = 100000
+	// postgres, etc. sit in the low thousands) while staying finite. maxTagTotal
+	// bounds the accumulated slice — a page cap alone admits hundreds of GB
+	// because each page can carry up to maxResponse bytes.
+	const (
+		maxTagPages = 100000
+		maxTagTotal = 100000
+	)
 	for page := 0; next != nil && page < maxTagPages; page++ {
 		resp, err := r.get(ctx, next, "application/json")
 		if err != nil {
@@ -59,6 +64,9 @@ func (r *Registry) Tags(ctx context.Context, repository string) ([]string, error
 			return nil, err
 		}
 		result = append(result, body.Tags...)
+		if len(result) > maxTagTotal {
+			return nil, errors.New("registry tag count exceeded")
+		}
 		next, err = nextLink(next, resp.Header.Get("Link"))
 		if err != nil {
 			return nil, err
