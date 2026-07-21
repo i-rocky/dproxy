@@ -98,14 +98,26 @@ func realBinaryTarget(execPath string) (string, bool) {
 		return "", false
 	}
 	target := filepath.Clean(strings.TrimSpace(string(raw)))
-	if target == "" || target == filepath.Clean(execPath) {
+	if target == "" {
 		return "", false
 	}
 	info, err := os.Stat(target)
 	if err != nil || info.IsDir() || info.Mode()&0o100 == 0 {
 		return "", false
 	}
+	// Guard against a record that resolves (via symlink) back to this shim: that
+	// would re-exec into itself forever. Compare resolved inodes, not path strings
+	// — two distinct strings can name the same file through symlinks.
+	if sameExecutable(target, execPath) {
+		return "", false
+	}
 	return target, true
+}
+
+func sameExecutable(a, b string) bool {
+	ia, ea := os.Stat(a)
+	ib, eb := os.Stat(b)
+	return ea == nil && eb == nil && os.SameFile(ia, ib)
 }
 
 func Execute(ctx context.Context, argv0 string, args []string, stdout, stderr io.Writer) int {

@@ -396,6 +396,9 @@ func setupCommand(streams Streams) error {
 	if err != nil {
 		return err
 	}
+	if err := os.MkdirAll(dataRoot, 0700); err != nil {
+		return err
+	}
 	store, err := plugin.NewStore(filepath.Join(dataRoot, "plugins"), nil)
 	if err != nil {
 		return err

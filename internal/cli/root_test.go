@@ -198,6 +198,16 @@ func TestRealBinaryTargetDecision(t *testing.T) {
 		_, ok := realBinaryTarget(shimPath)
 		require.False(t, ok)
 	})
+
+	// Record points at a symlink back to the shim → no re-exec (loop guard must
+	// compare resolved inodes, not path strings).
+	t.Run("symlink loop back to shim", func(t *testing.T) {
+		loop := filepath.Join(dir, "dproxy-loop")
+		require.NoError(t, os.Symlink(shimPath, loop))
+		require.NoError(t, os.WriteFile(record, []byte(loop), 0600))
+		_, ok := realBinaryTarget(shimPath)
+		require.False(t, ok, "a record resolving back to the shim must not re-exec")
+	})
 }
 
 func TestMaybeReexecFallsThroughWhenNotShim(t *testing.T) {

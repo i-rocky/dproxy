@@ -61,14 +61,20 @@ func Run(ctx context.Context, deps Dependencies, plan policy.Plan, streams IO) (
 	commandStarted, statusKnown := false, false
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
-		defer cancel()
 		if err := cleanup(cleanupCtx, deps.Engine, resources); err != nil && setupErr == nil {
 			setupErr = err
 		}
+		cancel()
 		if networkSession != nil {
-			if err := networkSession.Close(cleanupCtx); err != nil && setupErr == nil {
+			// Network removal gets its own fresh budget: containers self-reap via
+			// AutoRemove, but networks do not, and a slow container reap (polling
+			// waitContainerAbsent) can otherwise exhaust the shared timeout and
+			// leak the per-invocation network on the daemon.
+			netCtx, netCancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+			if err := networkSession.Close(netCtx); err != nil && setupErr == nil {
 				setupErr = fmt.Errorf("cleanup network session: %w", err)
 			}
+			netCancel()
 		}
 		if commandStarted && setupErr != nil {
 			var post *PostStartError
