@@ -689,6 +689,9 @@ func uninstallCommand() error {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
+	if err := os.Remove(filepath.Join(dataRoot, "shims", shim.TargetRecordName)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
 	return nil
 }
 

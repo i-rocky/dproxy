@@ -18,6 +18,12 @@ import (
 const genericName = "dproxy-shim"
 const rootMarker = ".dproxy-shim-owner"
 
+// TargetRecordName is the dotfile, written next to the generic shim, that
+// records the absolute path of the managing dproxy binary. The generic shim
+// consults it to re-exec the current binary, so a frozen shim copy left stale
+// by an upgrade (e.g. `go install`) transparently runs the fresh binary.
+const TargetRecordName = ".dproxy-target"
+
 var (
 	ErrCollision                                    = errors.New("unmanaged shim collision")
 	ErrUnsafeName                                   = errors.New("unsafe shim name")
@@ -124,6 +130,45 @@ func (m Manager) Sync(targets map[string]Target) error {
 			return err
 		}
 	}
+	if err := m.writeTargetRecord(shimFD); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeTargetRecord stores the absolute path of the managing dproxy binary next
+// to the generic shim. It is a hint consumed only by the dproxy binary itself
+// (cli.maybeReexecToRealBinary), not a security control, and is atomic so a
+// concurrent reader never sees a truncated path. Sync's validateRoots has
+// already guaranteed m.Executable is absolute and non-empty.
+func (m Manager) writeTargetRecord(shimFD int) error {
+	tmp, err := randomName(".target-")
+	if err != nil {
+		return err
+	}
+	fd, err := unix.Openat(shimFD, tmp, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0600)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(fd), tmp)
+	_, writeErr := f.WriteString(m.Executable)
+	closeErr := f.Close()
+	if writeErr != nil {
+		_ = unix.Unlinkat(shimFD, tmp, 0)
+		return writeErr
+	}
+	if closeErr != nil {
+		_ = unix.Unlinkat(shimFD, tmp, 0)
+		return closeErr
+	}
+	if err := unix.Renameat2(shimFD, tmp, shimFD, TargetRecordName, unix.RENAME_NOREPLACE); err == nil {
+		return nil
+	}
+	if err := unix.Renameat2(shimFD, tmp, shimFD, TargetRecordName, unix.RENAME_EXCHANGE); err != nil {
+		_ = unix.Unlinkat(shimFD, tmp, 0)
+		return err
+	}
+	_ = unix.Unlinkat(shimFD, tmp, 0)
 	return nil
 }
 

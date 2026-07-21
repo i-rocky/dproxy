@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/i-rocky/dproxy/internal/policy"
 	commandruntime "github.com/i-rocky/dproxy/internal/runtime"
+	"github.com/i-rocky/dproxy/internal/shim"
 	"github.com/stretchr/testify/require"
 )
 
@@ -151,4 +154,71 @@ func TestUsageAndPlanningFlagValidation(t *testing.T) {
 	require.Equal(t, 2, ExecuteWithDeps(context.Background(), "dproxy", []string{"npm"}, Dependencies{Stderr: &stderr}))
 	require.Contains(t, stderr.String(), "dependencies")
 	require.Equal(t, 2, ExecuteWithDeps(context.Background(), "/", nil, Dependencies{Runner: &fakeRunner{}}))
+}
+
+func TestRealBinaryTargetDecision(t *testing.T) {
+	dir := t.TempDir()
+	shimPath := filepath.Join(dir, genericShimName)
+	require.NoError(t, os.WriteFile(shimPath, []byte("stale-shim"), 0700))
+	execPath := filepath.Join(dir, "real-dproxy")
+	require.NoError(t, os.WriteFile(execPath, []byte("fresh"), 0700))
+	record := filepath.Join(dir, shim.TargetRecordName)
+
+	// No record → no re-exec.
+	t.Run("missing record", func(t *testing.T) {
+		_, ok := realBinaryTarget(shimPath)
+		require.False(t, ok)
+	})
+
+	// Record points to a distinct executable → re-exec target.
+	t.Run("distinct executable", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(record, []byte(execPath), 0600))
+		got, ok := realBinaryTarget(shimPath)
+		require.True(t, ok)
+		require.Equal(t, execPath, got)
+	})
+
+	// Record points back at the shim itself → no re-exec (avoids a loop).
+	t.Run("self reference", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(record, []byte(shimPath), 0600))
+		_, ok := realBinaryTarget(shimPath)
+		require.False(t, ok)
+	})
+
+	// Record points at a non-existent path → no re-exec (falls through).
+	t.Run("missing target", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(record, []byte(filepath.Join(dir, "nope")), 0600))
+		_, ok := realBinaryTarget(shimPath)
+		require.False(t, ok)
+	})
+
+	// Record points at a directory → no re-exec.
+	t.Run("directory target", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(record, []byte(t.TempDir()), 0600))
+		_, ok := realBinaryTarget(shimPath)
+		require.False(t, ok)
+	})
+}
+
+func TestMaybeReexecFallsThroughWhenNotShim(t *testing.T) {
+	// The test binary's basename is not the generic shim, so the preflight must
+	// return immediately without touching the filesystem or exec'ing.
+	require.NotPanics(t, func() { maybeReexecToRealBinary() })
+}
+
+func TestMaybeReexecReadsRecordWhenInvokedAsShim(t *testing.T) {
+	dir := t.TempDir()
+	shimPath := filepath.Join(dir, genericShimName)
+	require.NoError(t, os.WriteFile(shimPath, []byte("stale"), 0700))
+	old := currentExecutable
+	t.Cleanup(func() { currentExecutable = old })
+
+	// Lookup error → fall through.
+	currentExecutable = func() (string, error) { return "", errors.New("lookup failed") }
+	require.NotPanics(t, func() { maybeReexecToRealBinary() })
+
+	// Invoked as the shim but no record present → realBinaryTarget false → fall
+	// through (never reaching syscall.Exec, which would replace this process).
+	currentExecutable = func() (string, error) { return shimPath, nil }
+	require.NotPanics(t, func() { maybeReexecToRealBinary() })
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -557,4 +558,25 @@ func readRecordAtPath(m Manager, name string) (ownership, error) {
 	}
 	defer unix.Close(fd)
 	return readRecordAt(fd, name)
+}
+
+func TestSyncWritesTargetRecordForReexec(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"python": {Binary: "python"}}))
+
+	record := filepath.Join(m.ShimDir, TargetRecordName)
+	got, err := os.ReadFile(record)
+	require.NoError(t, err, "Sync must write the target record")
+	require.Equal(t, m.Executable, strings.TrimSpace(string(got)), "record must pin the managing binary path")
+}
+
+func TestSyncRefreshesTargetRecordAcrossRuns(t *testing.T) {
+	m := newShimManager(t)
+	require.NoError(t, m.Sync(map[string]Target{"python": {Binary: "python"}}))
+	record := filepath.Join(m.ShimDir, TargetRecordName)
+	require.NoError(t, os.WriteFile(record, []byte("/tmp/stale-path"), 0600))
+	require.NoError(t, m.Sync(map[string]Target{"python": {Binary: "python"}}))
+	got, err := os.ReadFile(record)
+	require.NoError(t, err)
+	require.NotEqual(t, "/tmp/stale-path", strings.TrimSpace(string(got)))
 }

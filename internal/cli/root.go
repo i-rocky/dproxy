@@ -10,9 +10,11 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"syscall"
 
 	"github.com/i-rocky/dproxy/internal/diagnostic"
 	"github.com/i-rocky/dproxy/internal/policy"
+	"github.com/i-rocky/dproxy/internal/shim"
 )
 
 // supportedOSes lists the host operating systems dproxy currently runs on.
@@ -60,11 +62,58 @@ type Dependencies struct {
 	Stdout, Stderr io.Writer
 }
 
+// currentExecutable resolves the running binary path. It is a variable so the
+// re-exec preflight is unit-testable without exec'ing the test process.
+var currentExecutable = os.Executable
+
+// maybeReexecToRealBinary replaces the running process with the managing dproxy
+// binary when this process is the managed generic shim. Managed shims are frozen
+// byte-copies, so after an upgrade (e.g. `go install @latest`) the copy lags
+// behind the real binary; the generic shim records that binary's path at install
+// time and re-execs it here, making the copy's staleness transparent. The fresh
+// binary then re-runs dispatch from scratch with the same argv/env. Any anomaly
+// (not the shim, no record, stale record, missing/non-executable target, or exec
+// failure) silently falls through to normal dispatch.
+func maybeReexecToRealBinary() {
+	execPath, err := currentExecutable()
+	if err != nil {
+		return
+	}
+	if filepath.Base(execPath) != genericShimName {
+		return
+	}
+	target, ok := realBinaryTarget(execPath)
+	if !ok {
+		return
+	}
+	_ = syscall.Exec(target, os.Args, os.Environ())
+}
+
+// realBinaryTarget reads the recorded managing-binary path next to the generic
+// shim and reports it when it names a distinct, executable regular file. It is
+// separated from maybeReexecToRealBinary so the decision is unit-testable.
+func realBinaryTarget(execPath string) (string, bool) {
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(execPath), shim.TargetRecordName))
+	if err != nil {
+		return "", false
+	}
+	target := filepath.Clean(strings.TrimSpace(string(raw)))
+	if target == "" || target == filepath.Clean(execPath) {
+		return "", false
+	}
+	info, err := os.Stat(target)
+	if err != nil || info.IsDir() || info.Mode()&0o100 == 0 {
+		return "", false
+	}
+	return target, true
+}
+
 func Execute(ctx context.Context, argv0 string, args []string, stdout, stderr io.Writer) int {
 	return ExecuteWithDeps(ctx, argv0, args, Dependencies{Runner: newSystemRunner(), Stdin: os.Stdin, Stdout: stdout, Stderr: stderr})
 }
 
 func ExecuteWithDeps(ctx context.Context, argv0 string, args []string, deps Dependencies) int {
+	maybeReexecToRealBinary()
 	streams := normalizeStreams(deps)
 	if err := assertSupportedRuntime(currentOS); err != nil {
 		fmt.Fprintln(streams.Stderr, "dproxy:", err)
