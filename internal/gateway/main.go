@@ -54,6 +54,14 @@ func LoadPolicy(path string) (networkpolicy.Policy, error) {
 	return p, err
 }
 
+// healthPolicyLoader returns the enforced policy and the exact bytes it was
+// parsed from in a single read. SystemHealth attests the policy hash from
+// these same bytes; reading them in a second pass (as an earlier version did,
+// via a separate os.ReadFile) would let the attested hash diverge from the
+// parsed ruleset — the startup TOCTOU LoadPolicyWithBytes exists to close.
+// Package-level so a test can assert it is consulted exactly once.
+var healthPolicyLoader = LoadPolicyWithBytes
+
 // LoadPolicyWithBytes reads, parses, and validates the policy in a single read
 // and returns the exact on-disk bytes alongside the parsed policy. Callers that
 // attest to the enforced policy must hash these bytes rather than re-reading
@@ -206,11 +214,7 @@ func SystemHealth(readyPath, policyPath, expectedToken, probeToken, dnsAddress s
 	if json.Unmarshal(stateBytes, &state) != nil {
 		return errors.New("invalid readiness state")
 	}
-	p, err := LoadPolicy(policyPath)
-	if err != nil {
-		return err
-	}
-	policyBytes, err := os.ReadFile(policyPath)
+	p, policyBytes, err := healthPolicyLoader(policyPath)
 	if err != nil {
 		return err
 	}

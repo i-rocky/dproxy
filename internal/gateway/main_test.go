@@ -35,6 +35,14 @@ func loadHashedPolicy(t *testing.T, path string) string {
 	return hex.EncodeToString(ph[:])
 }
 
+func writeReadyState(t *testing.T, path, policyHash, token string) {
+	t.Helper()
+	th := sha256.Sum256([]byte(token))
+	b, err := json.Marshal(readiness{Controls: readyState, PolicyHash: policyHash, TokenHash: hex.EncodeToString(th[:])})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, b, 0400))
+}
+
 func TestServePublishesAuthenticatedReadinessOnlyAfterControls(t *testing.T) {
 	dir := t.TempDir()
 	policyPath := filepath.Join(dir, "policy.json")
@@ -178,6 +186,32 @@ func TestSystemHealthChecksPolicyHashBeforeKernel(t *testing.T) {
 	require.ErrorContains(t, SystemHealth(ready, policy, "token", "token", "127.0.0.1:1"), "hash")
 	cancel()
 	<-done
+}
+
+// SystemHealth attests the policy hash from the same bytes it parsed; it must
+// not re-read the file to hash it (a second read would let the attested hash
+// diverge from the ruleset handed to the kernel attestation — the inter-read
+// TOCTOU LoadPolicyWithBytes exists to close).
+func TestSystemHealthReadsPolicyExactlyOnce(t *testing.T) {
+	dir := t.TempDir()
+	policy := filepath.Join(dir, "policy")
+	ready := filepath.Join(dir, "ready")
+	writePublicPolicy(t, policy)
+	policyHash := loadHashedPolicy(t, policy)
+	writeReadyState(t, ready, policyHash, "token")
+
+	orig := healthPolicyLoader
+	t.Cleanup(func() { healthPolicyLoader = orig })
+	var calls int
+	healthPolicyLoader = func(path string) (networkpolicy.Policy, []byte, error) {
+		calls++
+		if calls > 1 {
+			return networkpolicy.Policy{}, []byte("swapped"), nil
+		}
+		return LoadPolicyWithBytes(path)
+	}
+	_ = SystemHealth(ready, policy, "token", "token", "127.0.0.1:1")
+	require.Equal(t, 1, calls, "SystemHealth must read the policy exactly once, not re-read it to compute the hash")
 }
 
 func (f *fakeControls) InstallDNS(context.Context) error {
