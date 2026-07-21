@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/google/nftables"
@@ -30,6 +31,11 @@ type NFT struct {
 	DNSPort            uint16
 	table              *nftables.Table
 	allowed4, allowed6 *nftables.Set
+	// mu serializes Conn mutations. The DNS server dispatches each query on its
+	// own goroutine, and *nftables.Conn is not concurrency-safe: its message
+	// buffer is appended by SetAddElements and drained by Flush, so two
+	// interleaved Pin calls corrupt the netlink batch and silently drop the pin.
+	mu sync.Mutex
 }
 
 func (n *NFT) Install() error {
@@ -155,6 +161,8 @@ func (n *NFT) Pin(_ context.Context, pins []PinnedEndpoint, ttl time.Duration) e
 	if ttl <= 0 || ttl > 5*time.Minute {
 		return errors.New("invalid pin expiry")
 	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	var v4, v6 []nftables.SetElement
 	for _, pin := range pins {
 		if pin.Port == 0 || !pin.Addr.IsValid() || !n.Policy.AllowsIP(pin.Addr) {

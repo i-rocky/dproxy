@@ -1,7 +1,10 @@
 package gateway
 
 import (
+	"context"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -146,4 +149,45 @@ func TestNFTInstallDropsInboundExceptEstablishedAndLoopback(t *testing.T) {
 	}
 	require.Greater(t, hasEstablished, 0, "input must accept established/related return traffic")
 	require.GreaterOrEqual(t, loopbackRules, 4, "input must accept loopback DNS for IPv4+IPv6 × TCP+UDP")
+}
+
+type concurrencyTrackingConn struct {
+	*fakeNFTConn
+	inflight int32
+	maxSeen  int32
+}
+
+func (c *concurrencyTrackingConn) SetAddElements(s *nftables.Set, e []nftables.SetElement) error {
+	cur := atomic.AddInt32(&c.inflight, 1)
+	defer atomic.AddInt32(&c.inflight, -1)
+	for {
+		m := atomic.LoadInt32(&c.maxSeen)
+		if cur <= m || atomic.CompareAndSwapInt32(&c.maxSeen, m, cur) {
+			break
+		}
+	}
+	time.Sleep(3 * time.Millisecond) // widen the window so a missing lock would overlap
+	if c.fakeNFTConn != nil {
+		_ = c.fakeNFTConn.SetAddElements(s, e)
+	}
+	return nil
+}
+
+func TestNFTPinSerializesConcurrentSetAddElements(t *testing.T) {
+	p, err := networkpolicy.Allowlist([]string{"a.example:443", "b.example:443"})
+	require.NoError(t, err)
+	c := &concurrencyTrackingConn{fakeNFTConn: &fakeNFTConn{}}
+	n := &NFT{Conn: c, Policy: p, DNSPort: 1053}
+	require.NoError(t, n.Install())
+	addr := netip.MustParseAddr("93.184.216.34")
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = n.Pin(context.Background(), []PinnedEndpoint{{Addr: addr, Port: 443}}, time.Minute)
+		}()
+	}
+	wg.Wait()
+	require.EqualValues(t, 1, atomic.LoadInt32(&c.maxSeen), "Pin must serialize Conn mutation across concurrent DNS queries")
 }
