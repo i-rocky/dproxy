@@ -36,11 +36,8 @@ func (f *Filter) ResolveAndAuthorize(ctx context.Context, host string, port int)
 	if f == nil || f.resolver == nil {
 		return nil, errors.New("filter is not configured")
 	}
-	if !f.policy.AllowsDomain(host) {
-		return nil, errors.New("destination domain is not allowed")
-	}
-	if !f.policy.AllowsPort(port) {
-		return nil, errors.New("destination port is not allowed")
+	if !f.policy.AllowsEndpoint(host, port) {
+		return nil, errors.New("destination endpoint (host, port) is not allowed")
 	}
 	answers, err := f.resolver.LookupNetIP(ctx, "ip", strings.TrimSuffix(host, "."))
 	if err != nil {

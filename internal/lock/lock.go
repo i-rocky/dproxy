@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"net/url"
 	"os"
 	pathpkg "path"
@@ -190,6 +191,12 @@ func ValidExactVersion(value string) bool {
 func canonicalHTTPSRepository(value string) bool {
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path == "" || parsed.Path == "/" || pathpkg.Clean(parsed.Path) != parsed.Path || parsed.RawPath != "" || strings.ContainsRune(parsed.Path, '\\') || strings.IndexFunc(parsed.Path, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
+		return false
+	}
+	// Reject IP literals (127.0.0.1, 169.254.169.254, [::1], etc.): a plugin lock
+	// pinned to a private/link-local host is an SSRF vector if the lock is
+	// attacker-supplied. The hostPattern would otherwise accept them.
+	if _, err := netip.ParseAddr(parsed.Hostname()); err == nil {
 		return false
 	}
 	if !hostPattern.MatchString(parsed.Hostname()) || strings.ToLower(parsed.Host) != parsed.Host || parsed.Port() == "443" {

@@ -135,7 +135,7 @@ func TestGlobalConfigHashVerifies(t *testing.T) {
 
 func TestCanonicalHTTPSRepository(t *testing.T) {
 	require.True(t, canonicalHTTPSRepository("https://example.com/repo"))
-	for _, bad := range []string{"http://example.com/repo", "https://example.com/", "https://example.com/repo?x=1", "https://user:pass@example.com/repo", "https://example.com:443/repo", "https://Example.com/repo", "ftp://example.com/repo"} {
+	for _, bad := range []string{"http://example.com/repo", "https://example.com/", "https://example.com/repo?x=1", "https://user:pass@example.com/repo", "https://example.com:443/repo", "https://Example.com/repo", "ftp://example.com/repo", "https://127.0.0.1/repo", "https://169.254.169.254/repo", "https://10.0.0.1/repo"} {
 		require.False(t, canonicalHTTPSRepository(bad), bad)
 	}
 }
