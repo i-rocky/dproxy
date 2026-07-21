@@ -323,8 +323,22 @@ func (d *Docker) GatewayHealth(ctx context.Context, r Resource, token string) er
 	if attachErr != nil {
 		return fmt.Errorf("attach gateway health probe: %w", attachErr)
 	}
+	// The hijacked reader is not tied to ctx: StdCopy blocks until the daemon
+	// sends EOF, so a wedged gateway would outlive the probe's deadline. Drain in
+	// a goroutine and tear the connection down when ctx is cancelled.
 	var probeStdout, probeStderr bytes.Buffer
-	_, _ = stdcopy.StdCopy(&probeStdout, &probeStderr, attach.Reader)
+	copyDone := make(chan struct{})
+	go func() {
+		_, _ = stdcopy.StdCopy(&probeStdout, &probeStderr, attach.Reader)
+		close(copyDone)
+	}()
+	select {
+	case <-copyDone:
+	case <-ctx.Done():
+		attach.Close()
+		<-copyDone
+		return fmt.Errorf("gateway health probe: %w", ctx.Err())
+	}
 	attach.Close()
 	status, err := a.ContainerExecInspect(ctx, exec.ID)
 	if err != nil {

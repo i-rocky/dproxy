@@ -48,6 +48,8 @@ type fakeDockerAPI struct {
 	execExit        int
 	networks        []network.Summary
 	networkListErr  error
+	attachBlocking  bool
+	attachPeer      net.Conn
 }
 
 func (f *fakeDockerAPI) Info(context.Context) (system.Info, error)            { return f.info, nil }
@@ -122,6 +124,10 @@ func (f *fakeDockerAPI) ContainerExecCreate(_ context.Context, _ string, o conta
 }
 func (f *fakeDockerAPI) ContainerExecAttach(context.Context, string, container.ExecAttachOptions) (types.HijackedResponse, error) {
 	a, b := net.Pipe()
+	if f.attachBlocking {
+		f.attachPeer = b // leave open so reads on `a` block until Close()
+		return types.HijackedResponse{Conn: a, Reader: bufio.NewReader(a)}, nil
+	}
 	_ = b.Close()
 	return types.HijackedResponse{Conn: a, Reader: bufio.NewReader(a)}, nil
 }
@@ -452,4 +458,21 @@ func TestGatewayHealthRejectsInvalidRequests(t *testing.T) {
 
 func resourceLabels(r Resource) map[string]string {
 	return map[string]string{ManagedLabel: "true", ProjectLabel: r.Ownership.ProjectID, InvocationLabel: r.Ownership.InvocationID, RoleLabel: r.Role}
+}
+
+func TestGatewayHealthHonorsContextCancellation(t *testing.T) {
+	r := Resource{ID: "gateway", Ownership: Ownership{"project", "invocation"}, Role: GatewayRole}
+	api := &fakeDockerAPI{containerLabels: resourceLabels(r), attachBlocking: true}
+	t.Cleanup(func() {
+		if api.attachPeer != nil {
+			_ = api.attachPeer.Close()
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := NewDocker(api).GatewayHealth(ctx, r, "token")
+	elapsed := time.Since(start)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "must surface the cancelled ctx, not hang")
+	require.Less(t, elapsed, 2*time.Second, "must return promptly on ctx cancellation")
 }
